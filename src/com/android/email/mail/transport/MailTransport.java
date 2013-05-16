@@ -17,11 +17,12 @@
 package com.android.email.mail.transport;
 
 import com.android.email.Email;
-import com.android.email.mail.CertificateValidationException;
-import com.android.email.mail.MessagingException;
 import com.android.email.mail.Transport;
+import com.android.emailcommon.Logging;
+import com.android.emailcommon.mail.CertificateValidationException;
+import com.android.emailcommon.mail.MessagingException;
+import com.android.emailcommon.utility.SSLUtils;
 
-import android.util.Config;
 import android.util.Log;
 
 import java.io.BufferedInputStream;
@@ -34,7 +35,6 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.SocketException;
-import java.net.URI;
 
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.HttpsURLConnection;
@@ -44,11 +44,11 @@ import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSocket;
 
 /**
- * This class implements the common aspects of "transport", one layer below the 
+ * This class implements the common aspects of "transport", one layer below the
  * specific wire protocols such as POP3, IMAP, or SMTP.
  */
 public class MailTransport implements Transport {
-    
+
     // TODO protected eventually
     /*protected*/ public static final int SOCKET_CONNECT_TIMEOUT = 10000;
     /*protected*/ public static final int SOCKET_READ_TIMEOUT = 60000;
@@ -57,11 +57,20 @@ public class MailTransport implements Transport {
             HttpsURLConnection.getDefaultHostnameVerifier();
 
     private String mDebugLabel;
-    
+
     private String mHost;
     private int mPort;
     private String[] mUserInfoParts;
+
+    /**
+     * One of the {@code Transport.CONNECTION_SECURITY_*} values.
+     */
     private int mConnectionSecurity;
+
+    /**
+     * Whether or not to trust all server certificates (i.e. skip host verification) in SSL
+     * handshakes
+     */
     private boolean mTrustCertificates;
 
     private Socket mSocket;
@@ -69,7 +78,7 @@ public class MailTransport implements Transport {
     private OutputStream mOut;
 
     /**
-     * Simple constructor for starting from scratch.  Call setUri() and setSecurity() to 
+     * Simple constructor for starting from scratch.  Call setUri() and setSecurity() to
      * complete the configuration.
      * @param debugLabel Label used for Log.d calls
      */
@@ -77,15 +86,16 @@ public class MailTransport implements Transport {
         super();
         mDebugLabel = debugLabel;
     }
-    
+
     /**
-     * Get a new transport, using an existing one as a model.  The new transport is configured as if
-     * setUri() and setSecurity() have been called, but not opened or connected in any way.
-     * @return a new Transport ready to open()
+     * Returns a new transport, using the current transport as a model. The new transport is
+     * configured identically (as if {@link #setSecurity(int, boolean)}, {@link #setPort(int)}
+     * and {@link #setHost(String)} were invoked), but not opened or connected in any way.
      */
-    public Transport newInstanceWithConfiguration() {
+    @Override
+    public Transport clone() {
         MailTransport newObject = new MailTransport(mDebugLabel);
-        
+
         newObject.mDebugLabel = mDebugLabel;
         newObject.mHost = mHost;
         newObject.mPort = mPort;
@@ -97,49 +107,48 @@ public class MailTransport implements Transport {
         return newObject;
     }
 
-    public void setUri(URI uri, int defaultPort) {
-        mHost = uri.getHost();
-
-        mPort = defaultPort;
-        if (uri.getPort() != -1) {
-            mPort = uri.getPort();
-        }
-
-        if (uri.getUserInfo() != null) {
-            mUserInfoParts = uri.getUserInfo().split(":", 2);
-        }
-        
-    }
-    
-    public String[] getUserInfoParts() {
-        return mUserInfoParts;
+    @Override
+    public void setHost(String host) {
+        mHost = host;
     }
 
+    @Override
+    public void setPort(int port) {
+        mPort = port;
+    }
+
+    @Override
     public String getHost() {
         return mHost;
     }
 
+    @Override
     public int getPort() {
         return mPort;
     }
 
+    @Override
     public void setSecurity(int connectionSecurity, boolean trustAllCertificates) {
         mConnectionSecurity = connectionSecurity;
         mTrustCertificates = trustAllCertificates;
     }
 
+    @Override
     public int getSecurity() {
         return mConnectionSecurity;
     }
 
+    @Override
     public boolean canTrySslSecurity() {
-        return mConnectionSecurity == CONNECTION_SECURITY_SSL;
+        return mConnectionSecurity == Transport.CONNECTION_SECURITY_SSL;
     }
-    
+
+    @Override
     public boolean canTryTlsSecurity() {
         return mConnectionSecurity == Transport.CONNECTION_SECURITY_TLS;
     }
-    
+
+    @Override
     public boolean canTrustAllCertificates() {
         return mTrustCertificates;
     }
@@ -148,16 +157,18 @@ public class MailTransport implements Transport {
      * Attempts to open a connection using the Uri supplied for connection parameters.  Will attempt
      * an SSL connection if indicated.
      */
+    @Override
     public void open() throws MessagingException, CertificateValidationException {
-        if (Config.LOGD && Email.DEBUG) {
-            Log.d(Email.LOG_TAG, "*** " + mDebugLabel + " open " + 
+        if (Email.DEBUG) {
+            Log.d(Logging.LOG_TAG, "*** " + mDebugLabel + " open " +
                     getHost() + ":" + String.valueOf(getPort()));
         }
 
         try {
             SocketAddress socketAddress = new InetSocketAddress(getHost(), getPort());
             if (canTrySslSecurity()) {
-                mSocket = SSLUtils.getSSLSocketFactory(canTrustAllCertificates()).createSocket();
+                mSocket = SSLUtils.getSSLSocketFactory(
+                        canTrustAllCertificates(), SOCKET_CONNECT_TIMEOUT).createSocket();
             } else {
                 mSocket = new Socket();
             }
@@ -168,15 +179,15 @@ public class MailTransport implements Transport {
             }
             mIn = new BufferedInputStream(mSocket.getInputStream(), 1024);
             mOut = new BufferedOutputStream(mSocket.getOutputStream(), 512);
-            
+
         } catch (SSLException e) {
-            if (Config.LOGD && Email.DEBUG) {
-                Log.d(Email.LOG_TAG, e.toString());
+            if (Email.DEBUG) {
+                Log.d(Logging.LOG_TAG, e.toString());
             }
             throw new CertificateValidationException(e.getMessage(), e);
         } catch (IOException ioe) {
-            if (Config.LOGD && Email.DEBUG) {
-                Log.d(Email.LOG_TAG, ioe.toString());
+            if (Email.DEBUG) {
+                Log.d(Logging.LOG_TAG, ioe.toString());
             }
             throw new MessagingException(MessagingException.IOERROR, ioe.toString());
         }
@@ -190,22 +201,24 @@ public class MailTransport implements Transport {
      *
      * TODO should we explicitly close the old socket?  This seems funky to abandon it.
      */
+    @Override
     public void reopenTls() throws MessagingException {
         try {
-            mSocket = SSLUtils.getSSLSocketFactory(canTrustAllCertificates())
-                    .createSocket(mSocket, getHost(), getPort(), true);
+            mSocket =
+                    SSLUtils.getSSLSocketFactory(canTrustAllCertificates(), SOCKET_CONNECT_TIMEOUT)
+                            .createSocket(mSocket, getHost(), getPort(), true);
             mSocket.setSoTimeout(SOCKET_READ_TIMEOUT);
             mIn = new BufferedInputStream(mSocket.getInputStream(), 1024);
             mOut = new BufferedOutputStream(mSocket.getOutputStream(), 512);
 
         } catch (SSLException e) {
-            if (Config.LOGD && Email.DEBUG) {
-                Log.d(Email.LOG_TAG, e.toString());
+            if (Email.DEBUG) {
+                Log.d(Logging.LOG_TAG, e.toString());
             }
             throw new CertificateValidationException(e.getMessage(), e);
         } catch (IOException ioe) {
-            if (Config.LOGD && Email.DEBUG) {
-                Log.d(Email.LOG_TAG, ioe.toString());
+            if (Email.DEBUG) {
+                Log.d(Logging.LOG_TAG, ioe.toString());
             }
             throw new MessagingException(MessagingException.IOERROR, ioe.toString());
         }
@@ -254,70 +267,91 @@ public class MailTransport implements Transport {
      * @param timeoutMilliseconds the read timeout value if greater than {@code 0}, or
      *            {@code 0} for an infinite timeout.
      */
+    @Override
     public void setSoTimeout(int timeoutMilliseconds) throws SocketException {
         mSocket.setSoTimeout(timeoutMilliseconds);
     }
 
+    @Override
     public boolean isOpen() {
-        return (mIn != null && mOut != null && 
+        return (mIn != null && mOut != null &&
                 mSocket != null && mSocket.isConnected() && !mSocket.isClosed());
     }
 
     /**
      * Close the connection.  MUST NOT return any exceptions - must be "best effort" and safe.
      */
+    @Override
     public void close() {
+        if (Email.DEBUG) {
+            Log.d(Logging.LOG_TAG, "*** " + mDebugLabel + " close " +
+                    getHost() + ":" + String.valueOf(getPort()));
+        }
+
         try {
             mIn.close();
         } catch (Exception e) {
             // May fail if the connection is already closed.
+            if (Email.DEBUG) {
+                Log.d(Logging.LOG_TAG, e.toString());
+            }
         }
         try {
             mOut.close();
         } catch (Exception e) {
             // May fail if the connection is already closed.
+            if (Email.DEBUG) {
+                Log.d(Logging.LOG_TAG, e.toString());
+            }
         }
         try {
             mSocket.close();
         } catch (Exception e) {
             // May fail if the connection is already closed.
+            if (Email.DEBUG) {
+                Log.d(Logging.LOG_TAG, e.toString());
+            }
         }
         mIn = null;
         mOut = null;
         mSocket = null;
     }
 
+    @Override
     public InputStream getInputStream() {
         return mIn;
     }
 
+    @Override
     public OutputStream getOutputStream() {
         return mOut;
     }
-    
+
     /**
      * Writes a single line to the server using \r\n termination.
      */
+    @Override
     public void writeLine(String s, String sensitiveReplacement) throws IOException {
-        if (Config.LOGD && Email.DEBUG) {
-            if (sensitiveReplacement != null && !Email.DEBUG_SENSITIVE) {
-                Log.d(Email.LOG_TAG, ">>> " + sensitiveReplacement);
+        if (Email.DEBUG) {
+            if (sensitiveReplacement != null && !Logging.DEBUG_SENSITIVE) {
+                Log.d(Logging.LOG_TAG, ">>> " + sensitiveReplacement);
             } else {
-                Log.d(Email.LOG_TAG, ">>> " + s);
+                Log.d(Logging.LOG_TAG, ">>> " + s);
             }
         }
-        
+
         OutputStream out = getOutputStream();
         out.write(s.getBytes());
         out.write('\r');
         out.write('\n');
         out.flush();
     }
-    
+
     /**
      * Reads a single line from the server, using either \r\n or \n as the delimiter.  The
      * delimiter char(s) are not included in the result.
      */
+    @Override
     public String readLine() throws IOException {
         StringBuffer sb = new StringBuffer();
         InputStream in = getInputStream();
@@ -331,18 +365,17 @@ public class MailTransport implements Transport {
                 sb.append((char)d);
             }
         }
-        if (d == -1 && Config.LOGD && Email.DEBUG) {
-            Log.d(Email.LOG_TAG, "End of stream reached while trying to read line.");
+        if (d == -1 && Email.DEBUG) {
+            Log.d(Logging.LOG_TAG, "End of stream reached while trying to read line.");
         }
         String ret = sb.toString();
-        if (Config.LOGD) {
-            if (Email.DEBUG) {
-                Log.d(Email.LOG_TAG, "<<< " + ret);
-            }
+        if (Email.DEBUG) {
+            Log.d(Logging.LOG_TAG, "<<< " + ret);
         }
         return ret;
     }
 
+    @Override
     public InetAddress getLocalAddress() {
         if (isOpen()) {
             return mSocket.getLocalAddress();

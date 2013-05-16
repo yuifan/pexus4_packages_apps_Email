@@ -16,39 +16,48 @@
 
 package com.android.email.mail.store;
 
-import com.android.email.Email;
+import android.content.Context;
+import android.content.ContextWrapper;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager.NameNotFoundException;
+import android.os.Build;
+import android.os.Bundle;
+import android.test.InstrumentationTestCase;
+import android.test.MoreAsserts;
+import android.test.suitebuilder.annotation.SmallTest;
+
+import com.android.email.DBTestHelper;
+import com.android.email.MockSharedPreferences;
 import com.android.email.MockVendorPolicy;
-import com.android.email.Utility;
 import com.android.email.VendorPolicyLoader;
-import com.android.email.mail.Address;
-import com.android.email.mail.AuthenticationFailedException;
-import com.android.email.mail.Body;
-import com.android.email.mail.FetchProfile;
-import com.android.email.mail.Flag;
-import com.android.email.mail.Folder;
-import com.android.email.mail.Folder.FolderType;
-import com.android.email.mail.Folder.OpenMode;
-import com.android.email.mail.Message;
-import com.android.email.mail.Message.RecipientType;
-import com.android.email.mail.MessagingException;
-import com.android.email.mail.Part;
 import com.android.email.mail.Transport;
-import com.android.email.mail.internet.MimeBodyPart;
-import com.android.email.mail.internet.MimeMultipart;
-import com.android.email.mail.internet.MimeUtility;
-import com.android.email.mail.internet.TextBody;
-import com.android.email.mail.store.ImapStore.ImapConnection;
 import com.android.email.mail.store.ImapStore.ImapMessage;
 import com.android.email.mail.store.imap.ImapResponse;
 import com.android.email.mail.store.imap.ImapTestUtils;
 import com.android.email.mail.transport.MockTransport;
+import com.android.emailcommon.TempDirectory;
+import com.android.emailcommon.internet.MimeBodyPart;
+import com.android.emailcommon.internet.MimeMultipart;
+import com.android.emailcommon.internet.MimeUtility;
+import com.android.emailcommon.internet.TextBody;
+import com.android.emailcommon.mail.Address;
+import com.android.emailcommon.mail.AuthenticationFailedException;
+import com.android.emailcommon.mail.Body;
+import com.android.emailcommon.mail.FetchProfile;
+import com.android.emailcommon.mail.Flag;
+import com.android.emailcommon.mail.Folder;
+import com.android.emailcommon.mail.Folder.FolderType;
+import com.android.emailcommon.mail.Folder.OpenMode;
+import com.android.emailcommon.mail.Message;
+import com.android.emailcommon.mail.Message.RecipientType;
+import com.android.emailcommon.mail.MessagingException;
+import com.android.emailcommon.mail.Part;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.HostAuth;
+import com.android.emailcommon.provider.Mailbox;
+import com.android.emailcommon.utility.Utility;
 
 import org.apache.commons.io.IOUtils;
-
-import android.os.Bundle;
-import android.test.AndroidTestCase;
-import android.test.MoreAsserts;
-import android.test.suitebuilder.annotation.SmallTest;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -66,27 +75,59 @@ import java.util.regex.Pattern;
  * TODO test for BYE response in various places?
  */
 @SmallTest
-public class ImapStoreUnitTests extends AndroidTestCase {
+public class ImapStoreUnitTests extends InstrumentationTestCase {
     private final static String[] NO_REPLY = new String[0];
 
-    /**
-     * Default folder name.  In order to test for encoding, we use a non-ascii name.
-     */
+    /** Default folder name.  In order to test for encoding, we use a non-ascii name. */
     private final static String FOLDER_NAME = "\u65E5";
-
-    /**
-     * Folder name encoded in UTF-7.
-     */
+    /** Folder name encoded in UTF-7. */
     private final static String FOLDER_ENCODED = "&ZeU-";
+    /**
+     * Flag bits to specify whether or not a folder can be selected. This corresponds to
+     * {@link Mailbox#FLAG_ACCEPTS_MOVED_MAIL} and {@link Mailbox#FLAG_HOLDS_MAIL}.
+     */
+    private final static int SELECTABLE_BITS = 0x18;
 
     private final static ImapResponse CAPABILITY_RESPONSE = ImapTestUtils.parseResponse(
             "* CAPABILITY IMAP4rev1 STARTTLS");
 
     /* These values are provided by setUp() */
     private ImapStore mStore = null;
-    private ImapStore.ImapFolder mFolder = null;
+    private ImapFolder mFolder = null;
+    private Context mTestContext;
 
-    private int mNextTag;
+    /** The tag for the current IMAP command; used for mock transport responses */
+    private int mTag;
+    // Fields specific to the CopyMessages tests
+    private MockTransport mCopyMock;
+    private Folder mCopyToFolder;
+    private Message[] mCopyMessages;
+
+    /**
+     * A wrapper to provide a wrapper to a Context which has already been mocked.
+     * This allows additional methods to delegate to the original, real context, in cases
+     * where the mocked behavior is insufficient.
+     */
+    private class SecondaryMockContext extends ContextWrapper {
+        private final Context mUnderlying;
+
+        public SecondaryMockContext(Context mocked, Context underlying) {
+            super(mocked);
+            mUnderlying = underlying;
+        }
+
+        // TODO: eliminate the need for these method.
+        @Override
+        public Context createPackageContext(String packageName, int flags)
+                throws NameNotFoundException {
+            return mUnderlying.createPackageContext(packageName, flags);
+        }
+
+        @Override
+        public SharedPreferences getSharedPreferences(String name, int mode) {
+            return new MockSharedPreferences();
+        }
+    }
 
     /**
      * Setup code.  We generate a lightweight ImapStore and ImapStore.ImapFolder.
@@ -94,13 +135,28 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     @Override
     protected void setUp() throws Exception {
         super.setUp();
-        Email.setTempDirectory(getContext());
+        Context realContext = getInstrumentation().getTargetContext();
+        ImapStore.sImapId = ImapStore.makeCommonImapId(realContext.getPackageName(),
+                        Build.VERSION.RELEASE, Build.VERSION.CODENAME,
+                        Build.MODEL, Build.ID, Build.MANUFACTURER,
+                        "FakeNetworkOperator");
+        mTestContext = new SecondaryMockContext(
+                DBTestHelper.ProviderContextSetupHelper.getProviderContext(realContext),
+                realContext);
+        MockVendorPolicy.inject(mTestContext);
+
+        TempDirectory.setTempDirectory(mTestContext);
 
         // These are needed so we can get at the inner classes
-        mStore = (ImapStore) ImapStore.newInstance("imap://user:password@server:999",
-                getContext(), null);
-        mFolder = (ImapStore.ImapFolder) mStore.getFolder(FOLDER_NAME);
-        mNextTag = 1;
+        HostAuth testAuth = new HostAuth();
+        Account testAccount = new Account();
+
+        testAuth.setLogin("user", "password");
+        testAuth.setConnection("imap", "server", 999);
+        testAccount.mHostAuthRecv = testAuth;
+        mStore = (ImapStore) ImapStore.newInstance(testAccount, mTestContext);
+        mFolder = (ImapFolder) mStore.getFolder(FOLDER_NAME);
+        resetTag();
     }
 
     public void testJoinMessageUids() throws Exception {
@@ -123,7 +179,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
 
         // try to open it
         setupOpenFolder(mockTransport);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         // TODO: inject specific facts in the initial folder SELECT and check them here
     }
@@ -133,7 +189,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testLoginFailure() throws Exception {
         MockTransport mockTransport = openAndInjectMockTransport();
-        expectLogin(mockTransport, false, false, new String[] {"* iD nIL", "oK"},
+        expectLogin(mockTransport, false, false, false, new String[] {"* iD nIL", "oK"},
                 "nO authentication failed");
 
         try {
@@ -152,7 +208,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 false);
 
         // try to open it, with STARTTLS
-        expectLogin(mockTransport, true, false,
+        expectLogin(mockTransport, true, false, false,
                 new String[] {"* iD nIL", "oK"}, "oK user authenticated (Success)");
         mockTransport.expect(
                 getNextTag(false) + " SELECT \"" + FOLDER_ENCODED + "\"", new String[] {
@@ -165,7 +221,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 getNextTag(true) + " oK [" + "rEAD-wRITE" + "] " +
                         FOLDER_ENCODED + " selected. (Success)"});
 
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         assertTrue(mockTransport.isTlsStarted());
     }
 
@@ -190,10 +246,10 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         //   x-android-device-model Model (Optional, so not tested here)
         //   x-android-net-operator Carrier (Unreliable, so not tested here)
         //   AGUID           A device+account UID
-        String id = ImapStore.getImapId(getContext(), "user-name", "host-name",
-                CAPABILITY_RESPONSE);
+        String id = ImapStore.getImapId(mTestContext, "user-name", "host-name",
+                CAPABILITY_RESPONSE.flatten());
         HashMap<String, String> map = tokenizeImapId(id);
-        assertEquals(getContext().getPackageName(), map.get("name"));
+        assertEquals(mTestContext.getPackageName(), map.get("name"));
         assertEquals("android", map.get("os"));
         assertNotNull(map.get("os-version"));
         assertNotNull(map.get("vendor"));
@@ -233,7 +289,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testImapIdWithVendorPolicy() {
         try {
-            MockVendorPolicy.inject(getContext());
+            MockVendorPolicy.inject(mTestContext);
 
             // Prepare mock result
             Bundle result = new Bundle();
@@ -241,8 +297,8 @@ public class ImapStoreUnitTests extends AndroidTestCase {
             MockVendorPolicy.mockResult = result;
 
             // Invoke
-            String id = ImapStore.getImapId(getContext(), "user-name", "host-name",
-                    ImapTestUtils.parseResponse("* CAPABILITY IMAP4rev1 XXX YYY Z"));
+            String id = ImapStore.getImapId(mTestContext, "user-name", "host-name",
+                    ImapTestUtils.parseResponse("* CAPABILITY IMAP4rev1 XXX YYY Z").flatten());
 
             // Check the result
             assertEquals("test-value", tokenizeImapId(id).get("test-key"));
@@ -285,16 +341,37 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      * Test that IMAP ID uid's are per-username
      */
     public void testImapIdDeviceId() throws MessagingException {
-        ImapStore store1a = (ImapStore) ImapStore.newInstance("imap://user1:password@server:999",
-                getContext(), null);
-        ImapStore store1b = (ImapStore) ImapStore.newInstance("imap://user1:password@server:999",
-                getContext(), null);
-        ImapStore store2 = (ImapStore) ImapStore.newInstance("imap://user2:password@server:999",
-                getContext(), null);
+        HostAuth testAuth;
+        Account testAccount;
 
-        String id1a = ImapStore.getImapId(getContext(), "user1", "host-name", CAPABILITY_RESPONSE);
-        String id1b = ImapStore.getImapId(getContext(), "user1", "host-name", CAPABILITY_RESPONSE);
-        String id2 = ImapStore.getImapId(getContext(), "user2", "host-name", CAPABILITY_RESPONSE);
+        // store 1a
+        testAuth = new HostAuth();
+        testAuth.setLogin("user1", "password");
+        testAuth.setConnection("imap", "server", 999);
+        testAccount = new Account();
+        testAccount.mHostAuthRecv = testAuth;
+        ImapStore testStore1A = (ImapStore) ImapStore.newInstance(testAccount, mTestContext);
+
+        // store 1b
+        testAuth = new HostAuth();
+        testAuth.setLogin("user1", "password");
+        testAuth.setConnection("imap", "server", 999);
+        testAccount = new Account();
+        testAccount.mHostAuthRecv = testAuth;
+        ImapStore testStore1B = (ImapStore) ImapStore.newInstance(testAccount, mTestContext);
+
+        // store 2
+        testAuth = new HostAuth();
+        testAuth.setLogin("user2", "password");
+        testAuth.setConnection("imap", "server", 999);
+        testAccount = new Account();
+        testAccount.mHostAuthRecv = testAuth;
+        ImapStore testStore2 = (ImapStore) ImapStore.newInstance(testAccount, mTestContext);
+
+        String capabilities = CAPABILITY_RESPONSE.flatten();
+        String id1a = ImapStore.getImapId(mTestContext, "user1", "host-name", capabilities);
+        String id1b = ImapStore.getImapId(mTestContext, "user1", "host-name", capabilities);
+        String id2 = ImapStore.getImapId(mTestContext, "user2", "host-name", capabilities);
 
         String uid1a = tokenizeImapId(id1a).get("AGUID");
         String uid1b = tokenizeImapId(id1b).get("AGUID");
@@ -338,7 +415,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 " \"os\" \"sunos\" \"os-version\" \"5.5\"" +
                 " \"support-url\" \"mailto:cyrus-bugs+@andrew.cmu.edu\")",
                 "oK"}, "rEAD-wRITE");
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
     }
 
     /**
@@ -351,7 +428,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         setupOpenFolder(mockTransport, new String[] {
                 "* iD nIL",
                 "oK [iD] bad-char-%"}, "rEAD-wRITE");
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
     }
 
     /**
@@ -363,7 +440,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         // try to open it
         setupOpenFolder(mockTransport, new String[] {
                 "bAD unknown command bad-char-%"}, "rEAD-wRITE");
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
     }
 
     /**
@@ -376,21 +453,64 @@ public class ImapStoreUnitTests extends AndroidTestCase {
 
         // try to open it
         setupOpenFolder(mockTransport, null, "rEAD-wRITE");
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
+    }
+
+    /**
+     * Confirm that the non-conformant IMAP ID result seen on imap.secureserver.net fails
+     * to properly parse.
+     *   2 ID ("name" "com.google.android.email")
+     *   * ID( "name" "Godaddy IMAP" ... "version" "3.1.0")
+     *   2 OK ID completed
+     */
+    public void testImapIdSecureServerParseFail() {
+        MockTransport mockTransport = openAndInjectMockTransport();
+
+        // configure mock server to return malformed ID response
+        setupOpenFolder(mockTransport, new String[] {
+                "* ID( \"name\" \"Godaddy IMAP\" \"version\" \"3.1.0\")",
+                "oK"}, "rEAD-wRITE");
+        try {
+            mFolder.open(OpenMode.READ_WRITE);
+            fail("Expected MessagingException");
+        } catch (MessagingException expected) {
+        }
+    }
+
+    /**
+     * Confirm that the connections to *.secureserver.net never send IMAP ID (see
+     * testImapIdSecureServerParseFail() for the reason why.)
+     */
+    public void testImapIdSecureServerNotSent() throws MessagingException {
+        // Note, this is injected into mStore (which we don't use for this test)
+        MockTransport mockTransport = openAndInjectMockTransport();
+        mockTransport.setHost("eMail.sEcurEserVer.nEt");
+
+        // Prime the expects pump as if the server wants IMAP ID, but we should not actually expect
+        // to send it, because the login code in the store should never actually send it (to this
+        // particular server).  This sequence is a minimized version of expectLogin().
+
+        // Respond to the initial connection
+        mockTransport.expect(null, "* oK Imap 2000 Ready To Assist You");
+        // Return "ID" in the capability
+        expectCapability(mockTransport, true, false);
+        // No TLS
+        // No ID (the special case for this server)
+        // LOGIN
+        mockTransport.expect(getNextTag(false) + " LOGIN user \"password\"",
+                getNextTag(true) + " " + "oK user authenticated (Success)");
+        // SELECT
+        expectSelect(mockTransport, FOLDER_ENCODED, "rEAD-wRITE");
+
+        // Now open the folder.  Although the server indicates ID in the capabilities,
+        // we are not expecting the store to send the ID command (to this particular server).
+        mFolder.open(OpenMode.READ_WRITE);
     }
 
     /**
      * Test small Folder functions that don't really do anything in Imap
      */
-    public void testSmallFolderFunctions() throws MessagingException {
-        // getPermanentFlags() returns { Flag.DELETED, Flag.SEEN, Flag.FLAGGED }
-        Flag[] flags = mFolder.getPermanentFlags();
-        assertEquals(3, flags.length);
-        // TODO: Write flags into hashset and compare them to a hashset and compare them
-        assertEquals(Flag.DELETED, flags[0]);
-        assertEquals(Flag.SEEN, flags[1]);
-        assertEquals(Flag.FLAGGED, flags[2]);
-
+    public void testSmallFolderFunctions() {
         // canCreate() returns true
         assertTrue(mFolder.canCreate(FolderType.HOLDS_FOLDERS));
         assertTrue(mFolder.canCreate(FolderType.HOLDS_MESSAGES));
@@ -404,13 +524,6 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testNoFolderRolesYet() {
         assertEquals(Folder.FolderRole.UNKNOWN, mFolder.getRole());
-    }
-
-    /**
-     * Lightweight test to confirm that IMAP isn't requesting structure prefetch.
-     */
-    public void testNoStructurePrefetch() {
-        assertFalse(mStore.requireStructurePrefetch());
     }
 
     /**
@@ -442,8 +555,8 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         // Create mock transport and inject it into the ImapStore that's already set up
         MockTransport mockTransport = new MockTransport();
         mockTransport.setSecurity(connectionSecurity, trustAllCertificates);
-        mockTransport.setMockHost("mock.server.com");
-        mStore.setTransport(mockTransport);
+        mockTransport.setHost("mock.server.com");
+        mStore.setTransportForTest(mockTransport);
         return mockTransport;
     }
 
@@ -463,7 +576,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     private void setupOpenFolder(MockTransport mockTransport, String readWriteMode) {
         setupOpenFolder(mockTransport, new String[] {
-                "* iD nIL", "oK"}, readWriteMode);
+                "* iD nIL", "oK"}, readWriteMode, false);
     }
 
     /**
@@ -480,9 +593,23 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     private void setupOpenFolder(MockTransport mockTransport, String[] imapIdResponse,
             String readWriteMode) {
-        expectLogin(mockTransport, imapIdResponse);
+        setupOpenFolder(mockTransport, imapIdResponse, readWriteMode, false);
+    }
+
+    private void setupOpenFolder(MockTransport mockTransport, String[] imapIdResponse,
+            String readWriteMode, boolean withUidPlus) {
+        expectLogin(mockTransport, imapIdResponse, withUidPlus);
+        expectSelect(mockTransport, FOLDER_ENCODED, readWriteMode);
+    }
+
+    /**
+     * Helper which stuffs the mock with the strings to satisfy a typical SELECT.
+     * @param mockTransport the mock transport we're using
+     * @param readWriteMode "READ-WRITE" or "READ-ONLY"
+     */
+    private void expectSelect(MockTransport mockTransport, String folder, String readWriteMode) {
         mockTransport.expect(
-                getNextTag(false) + " SELECT \"" + FOLDER_ENCODED + "\"", new String[] {
+                getNextTag(false) + " SELECT \"" + folder + "\"", new String[] {
                 "* fLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen)",
                 "* oK [pERMANENTFLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen \\*)]",
                 "* 0 eXISTS",
@@ -490,24 +617,25 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 "* OK [uNSEEN 0]",
                 "* OK [uIDNEXT 1]",
                 getNextTag(true) + " oK [" + readWriteMode + "] " +
-                        FOLDER_ENCODED + " selected. (Success)"});
+                        folder + " selected. (Success)"});
     }
 
     private void expectLogin(MockTransport mockTransport) {
-        expectLogin(mockTransport, new String[] {"* iD nIL", "oK"});
+        expectLogin(mockTransport, new String[] {"* iD nIL", "oK"}, false);
     }
 
-    private void expectLogin(MockTransport mockTransport, String[] imapIdResponse) {
-        expectLogin(mockTransport, false, (imapIdResponse != null), imapIdResponse,
+    private void expectLogin(MockTransport mockTransport, String[] imapIdResponse,
+            boolean withUidPlus) {
+        expectLogin(mockTransport, false, (imapIdResponse != null), withUidPlus, imapIdResponse,
                 "oK user authenticated (Success)");
     }
 
     private void expectLogin(MockTransport mockTransport, boolean startTls, boolean withId,
-            String[] imapIdResponse, String loginResponse) {
+            boolean withUidPlus, String[] imapIdResponse, String loginResponse) {
         // inject boilerplate commands that match our typical login
         mockTransport.expect(null, "* oK Imap 2000 Ready To Assist You");
 
-        expectCapability(mockTransport, withId);
+        expectCapability(mockTransport, withId, withUidPlus);
 
         // TLS (if expected)
         if (startTls) {
@@ -515,7 +643,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 getNextTag(true) + " Ok starting TLS");
             mockTransport.expectStartTls();
             // After switching to TLS the client must re-query for capability
-            expectCapability(mockTransport, withId);
+            expectCapability(mockTransport, withId, withUidPlus);
         }
 
         // ID
@@ -534,10 +662,11 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 getNextTag(true) + " " + loginResponse);
     }
 
-    private void expectCapability(MockTransport mockTransport, boolean withId) {
-        String capabilityList = withId
-                ? "* cAPABILITY iMAP4rev1 sTARTTLS aUTH=gSSAPI lOGINDISABLED iD"
-                : "* cAPABILITY iMAP4rev1 sTARTTLS aUTH=gSSAPI lOGINDISABLED";
+    private void expectCapability(MockTransport mockTransport, boolean withId,
+            boolean withUidPlus) {
+        String capabilityList = "* cAPABILITY iMAP4rev1 sTARTTLS aUTH=gSSAPI lOGINDISABLED";
+        capabilityList += withId ? " iD" : "";
+        capabilityList += withUidPlus ? " UiDPlUs" : "";
 
         mockTransport.expect(getNextTag(false) + " CAPABILITY", new String[] {
             capabilityList,
@@ -558,8 +687,22 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      * @return a string containing the current tag
      */
     public String getNextTag(boolean advance)  {
-        if (advance) ++mNextTag;
-        return Integer.toString(mNextTag);
+        if (advance) ++mTag;
+        return Integer.toString(mTag);
+    }
+
+    /**
+     * Resets the tag back to it's starting value. Do this after the test connection has been
+     * closed.
+     */
+    private int resetTag() {
+        return resetTag(1);
+    }
+
+    private int resetTag(int tag) {
+        int oldTag = mTag;
+        mTag = tag;
+        return oldTag;
     }
 
     /**
@@ -569,7 +712,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testReadWrite() throws MessagingException {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock, "rEAD-WRITE");
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         assertEquals(OpenMode.READ_WRITE, mFolder.getMode());
     }
 
@@ -580,7 +723,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testReadOnly() throws MessagingException {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock, "rEAD-ONLY");
-        mFolder.open(OpenMode.READ_ONLY, null);
+        mFolder.open(OpenMode.READ_ONLY);
         assertEquals(OpenMode.READ_ONLY, mFolder.getMode());
     }
 
@@ -595,7 +738,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 new String[] {
                 "* sTATUS \"" + FOLDER_ENCODED + "\" (uNSEEN 2)",
                 getNextTag(true) + " oK STATUS completed"});
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         int unreadCount = mFolder.getUnreadMessageCount();
         assertEquals("getUnreadMessageCount with quoted string", 2, unreadCount);
     }
@@ -612,7 +755,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 "* sTATUS {5}",
                 FOLDER_ENCODED + " (uNSEEN 10)",
                 getNextTag(true) + " oK STATUS completed"});
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         int unreadCount = mFolder.getUnreadMessageCount();
         assertEquals("getUnreadMessageCount with literal string", 10, unreadCount);
     }
@@ -620,7 +763,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testFetchFlagEnvelope() throws MessagingException {
         final MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         final Message message = mFolder.createMessage("1");
 
         final FetchProfile fp = new FetchProfile();
@@ -661,7 +804,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testFetchBodyStructureSimple() throws Exception {
         final MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         final Message message = mFolder.createMessage("1");
 
         final FetchProfile fp = new FetchProfile();
@@ -700,7 +843,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testFetchBodyStructureMultipart() throws Exception {
         final MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         final Message message = mFolder.createMessage("1");
 
         final FetchProfile fp = new FetchProfile();
@@ -822,7 +965,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testFetchBodySane() throws MessagingException {
         final MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         final Message message = mFolder.createMessage("1");
 
         final FetchProfile fp = new FetchProfile();
@@ -845,7 +988,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testFetchBody() throws MessagingException {
         final MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         final Message message = mFolder.createMessage("1");
 
         final FetchProfile fp = new FetchProfile();
@@ -868,7 +1011,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testFetchAttachment() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         final Message message = mFolder.createMessage("1");
 
         final FetchProfile fp = new FetchProfile();
@@ -918,7 +1061,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testNilMessage() throws MessagingException {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         // Prepare to pull structure and peek body text - this is like the "large message"
         // loop in MessagingController.synchronizeMailboxGeneric()
@@ -975,7 +1118,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testExcessFetchResult() throws MessagingException {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         // Create a message, and make sure it's not "SEEN".
         Message message1 = mFolder.createMessage("1");
@@ -1036,7 +1179,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testAppendMessages() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         ImapMessage message = prepareForAppendTest(mock, "oK [aPPENDUID 1234567 13] (Success)");
 
@@ -1052,15 +1195,23 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testAppendMessagesNoAppendUid() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         ImapMessage message = prepareForAppendTest(mock, "OK Success");
 
+        // First try w/o parenthesis
+        mock.expectLiterally(
+                getNextTag(false) + " UID SEARCH HEADER MESSAGE-ID <message.id@test.com>",
+                new String[] {
+                    "* sEARCH 321",
+                    getNextTag(true) + " oK success"
+                });
+        // If that fails, then try w/ parenthesis
         mock.expectLiterally(
                 getNextTag(false) + " UID SEARCH (HEADER MESSAGE-ID <message.id@test.com>)",
                 new String[] {
-                "* sEARCH 321",
-                getNextTag(true) + " oK success"
+                    "* sEARCH 321",
+                    getNextTag(true) + " oK success"
                 });
 
         mFolder.appendMessages(new Message[] {message});
@@ -1078,16 +1229,23 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testAppendFailure() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         ImapMessage message = prepareForAppendTest(mock, "NO No space left on the server.");
         assertEquals("initial uid", message.getUid());
-
+        // First try w/o parenthesis
+        mock.expectLiterally(
+                getNextTag(false) + " UID SEARCH HEADER MESSAGE-ID <message.id@test.com>",
+                new String[] {
+                    "* sEARCH", // not found
+                    getNextTag(true) + " oK Search completed."
+                });
+        // If that fails, then try w/ parenthesis
         mock.expectLiterally(
                 getNextTag(false) + " UID SEARCH (HEADER MESSAGE-ID <message.id@test.com>)",
                 new String[] {
-                "* sEARCH", // not found
-                getNextTag(true) + " oK Search completed."
+                    "* sEARCH", // not found
+                    getNextTag(true) + " oK Search completed."
                 });
 
         mFolder.appendMessages(new Message[] {message});
@@ -1096,10 +1254,11 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         assertEquals("initial uid", message.getUid());
     }
 
-    public void testGetPersonalNamespaces() throws Exception {
+    public void testGetAllFolders() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         expectLogin(mock);
 
+        expectNoop(mock, true);
         mock.expect(getNextTag(false) + " LIST \"\" \"\\*\"",
                 new String[] {
                 "* lIST (\\HAsNoChildren) \"/\" \"inbox\"",
@@ -1108,35 +1267,178 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 "* lIST (\\HAsNoChildren) \"/\" \"&ZeVnLIqe-\"", // Japanese folder name
                 getNextTag(true) + " oK SUCCESS"
                 });
-        Folder[] folders = mStore.getPersonalNamespaces();
+        Folder[] folders = mStore.updateFolders();
+        ImapFolder testFolder;
 
-        ArrayList<String> list = new ArrayList<String>();
-        for (Folder f : folders) {
-            list.add(f.getName());
-        }
-        MoreAsserts.assertEquals(
-                new String[] {"Drafts", "\u65E5\u672C\u8A9E", "INBOX"},
-                list.toArray(new String[0])
-                );
+        testFolder = (ImapFolder) folders[0];
+        assertEquals("INBOX", testFolder.getName());
+        assertEquals(SELECTABLE_BITS, testFolder.mMailbox.mFlags & SELECTABLE_BITS);
 
+        testFolder = (ImapFolder) folders[1];
+        assertEquals("no select", testFolder.getName());
+        assertEquals(0, testFolder.mMailbox.mFlags & SELECTABLE_BITS);
+
+        testFolder = (ImapFolder) folders[2];
+        assertEquals("\u65E5\u672C\u8A9E", testFolder.getName());
+        assertEquals(SELECTABLE_BITS, testFolder.mMailbox.mFlags & SELECTABLE_BITS);
+
+        testFolder = (ImapFolder) folders[3];
+        assertEquals("Drafts", testFolder.getName());
+        assertEquals(SELECTABLE_BITS, testFolder.mMailbox.mFlags & SELECTABLE_BITS);
         // TODO test with path prefix
         // TODO: Test NO response.
     }
 
     public void testEncodeFolderName() {
-        assertEquals("", ImapStore.encodeFolderName(""));
-        assertEquals("a", ImapStore.encodeFolderName("a"));
-        assertEquals("XYZ", ImapStore.encodeFolderName("XYZ"));
-        assertEquals("&ZeVnLIqe-", ImapStore.encodeFolderName("\u65E5\u672C\u8A9E"));
-        assertEquals("!&ZeVnLIqe-!", ImapStore.encodeFolderName("!\u65E5\u672C\u8A9E!"));
+        // null prefix
+        assertEquals("",
+                ImapStore.encodeFolderName("", null));
+        assertEquals("a",
+                ImapStore.encodeFolderName("a", null));
+        assertEquals("XYZ",
+                ImapStore.encodeFolderName("XYZ", null));
+        assertEquals("&ZeVnLIqe-",
+                ImapStore.encodeFolderName("\u65E5\u672C\u8A9E", null));
+        assertEquals("!&ZeVnLIqe-!",
+                ImapStore.encodeFolderName("!\u65E5\u672C\u8A9E!", null));
+        // empty prefix (same as a null prefix)
+        assertEquals("",
+                ImapStore.encodeFolderName("", ""));
+        assertEquals("a",
+                ImapStore.encodeFolderName("a", ""));
+        assertEquals("XYZ",
+                ImapStore.encodeFolderName("XYZ", ""));
+        assertEquals("&ZeVnLIqe-",
+                ImapStore.encodeFolderName("\u65E5\u672C\u8A9E", ""));
+        assertEquals("!&ZeVnLIqe-!",
+                ImapStore.encodeFolderName("!\u65E5\u672C\u8A9E!", ""));
+        // defined prefix
+        assertEquals("[Gmail]/",
+                ImapStore.encodeFolderName("", "[Gmail]/"));
+        assertEquals("[Gmail]/a",
+                ImapStore.encodeFolderName("a", "[Gmail]/"));
+        assertEquals("[Gmail]/XYZ",
+                ImapStore.encodeFolderName("XYZ", "[Gmail]/"));
+        assertEquals("[Gmail]/&ZeVnLIqe-",
+                ImapStore.encodeFolderName("\u65E5\u672C\u8A9E", "[Gmail]/"));
+        assertEquals("[Gmail]/!&ZeVnLIqe-!",
+                ImapStore.encodeFolderName("!\u65E5\u672C\u8A9E!", "[Gmail]/"));
+        // Add prefix to special mailbox "INBOX" [case insensitive), no affect
+        assertEquals("INBOX",
+                ImapStore.encodeFolderName("INBOX", "[Gmail]/"));
+        assertEquals("inbox",
+                ImapStore.encodeFolderName("inbox", "[Gmail]/"));
+        assertEquals("InBoX",
+                ImapStore.encodeFolderName("InBoX", "[Gmail]/"));
     }
 
     public void testDecodeFolderName() {
-        assertEquals("", ImapStore.decodeFolderName(""));
-        assertEquals("a", ImapStore.decodeFolderName("a"));
-        assertEquals("XYZ", ImapStore.decodeFolderName("XYZ"));
-        assertEquals("\u65E5\u672C\u8A9E", ImapStore.decodeFolderName("&ZeVnLIqe-"));
-        assertEquals("!\u65E5\u672C\u8A9E!", ImapStore.decodeFolderName("!&ZeVnLIqe-!"));
+        // null prefix
+        assertEquals("",
+                ImapStore.decodeFolderName("", null));
+        assertEquals("a",
+                ImapStore.decodeFolderName("a", null));
+        assertEquals("XYZ",
+                ImapStore.decodeFolderName("XYZ", null));
+        assertEquals("\u65E5\u672C\u8A9E",
+                ImapStore.decodeFolderName("&ZeVnLIqe-", null));
+        assertEquals("!\u65E5\u672C\u8A9E!",
+                ImapStore.decodeFolderName("!&ZeVnLIqe-!", null));
+        // empty prefix (same as a null prefix)
+        assertEquals("",
+                ImapStore.decodeFolderName("", ""));
+        assertEquals("a",
+                ImapStore.decodeFolderName("a", ""));
+        assertEquals("XYZ",
+                ImapStore.decodeFolderName("XYZ", ""));
+        assertEquals("\u65E5\u672C\u8A9E",
+                ImapStore.decodeFolderName("&ZeVnLIqe-", ""));
+        assertEquals("!\u65E5\u672C\u8A9E!",
+                ImapStore.decodeFolderName("!&ZeVnLIqe-!", ""));
+        // defined prefix; prefix found, prefix removed
+        assertEquals("",
+                ImapStore.decodeFolderName("[Gmail]/", "[Gmail]/"));
+        assertEquals("a",
+                ImapStore.decodeFolderName("[Gmail]/a", "[Gmail]/"));
+        assertEquals("XYZ",
+                ImapStore.decodeFolderName("[Gmail]/XYZ", "[Gmail]/"));
+        assertEquals("\u65E5\u672C\u8A9E",
+                ImapStore.decodeFolderName("[Gmail]/&ZeVnLIqe-", "[Gmail]/"));
+        assertEquals("!\u65E5\u672C\u8A9E!",
+                ImapStore.decodeFolderName("[Gmail]/!&ZeVnLIqe-!", "[Gmail]/"));
+        // defined prefix; prefix not found, no affect
+        assertEquals("INBOX/",
+                ImapStore.decodeFolderName("INBOX/", "[Gmail]/"));
+        assertEquals("INBOX/a",
+                ImapStore.decodeFolderName("INBOX/a", "[Gmail]/"));
+        assertEquals("INBOX/XYZ",
+                ImapStore.decodeFolderName("INBOX/XYZ", "[Gmail]/"));
+        assertEquals("INBOX/\u65E5\u672C\u8A9E",
+                ImapStore.decodeFolderName("INBOX/&ZeVnLIqe-", "[Gmail]/"));
+        assertEquals("INBOX/!\u65E5\u672C\u8A9E!",
+                ImapStore.decodeFolderName("INBOX/!&ZeVnLIqe-!", "[Gmail]/"));
+    }
+
+    public void testEnsurePrefixIsValid() {
+        // Test mPathSeparator == null
+        mStore.mPathSeparator = null;
+        mStore.mPathPrefix = null;
+        mStore.ensurePrefixIsValid();
+        assertNull(mStore.mPathPrefix);
+
+        mStore.mPathPrefix = "";
+        mStore.ensurePrefixIsValid();
+        assertEquals("", mStore.mPathPrefix);
+
+        mStore.mPathPrefix = "foo";
+        mStore.ensurePrefixIsValid();
+        assertEquals("foo", mStore.mPathPrefix);
+
+        mStore.mPathPrefix = "foo.";
+        mStore.ensurePrefixIsValid();
+        assertEquals("foo.", mStore.mPathPrefix);
+
+        // Test mPathSeparator == ""
+        mStore.mPathSeparator = "";
+        mStore.mPathPrefix = null;
+        mStore.ensurePrefixIsValid();
+        assertNull(mStore.mPathPrefix);
+
+        mStore.mPathPrefix = "";
+        mStore.ensurePrefixIsValid();
+        assertEquals("", mStore.mPathPrefix);
+
+        mStore.mPathPrefix = "foo";
+        mStore.ensurePrefixIsValid();
+        assertEquals("foo", mStore.mPathPrefix);
+
+        mStore.mPathPrefix = "foo.";
+        mStore.ensurePrefixIsValid();
+        assertEquals("foo.", mStore.mPathPrefix);
+
+        // Test mPathSeparator is non-empty
+        mStore.mPathSeparator = ".";
+        mStore.mPathPrefix = null;
+        mStore.ensurePrefixIsValid();
+        assertNull(mStore.mPathPrefix);
+
+        mStore.mPathPrefix = "";
+        mStore.ensurePrefixIsValid();
+        assertEquals("", mStore.mPathPrefix);
+
+        mStore.mPathPrefix = "foo";
+        mStore.ensurePrefixIsValid();
+        assertEquals("foo.", mStore.mPathPrefix);
+
+        // Trailing separator; path separator NOT appended
+        mStore.mPathPrefix = "foo.";
+        mStore.ensurePrefixIsValid();
+        assertEquals("foo.", mStore.mPathPrefix);
+
+        // Trailing punctuation has no affect; path separator still appended
+        mStore.mPathPrefix = "foo/";
+        mStore.ensurePrefixIsValid();
+        assertEquals("foo/.", mStore.mPathPrefix);
     }
 
     public void testOpen() throws Exception {
@@ -1151,7 +1453,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 getNextTag(true) + " nO no such mailbox"
                 });
         try {
-            folder.open(OpenMode.READ_WRITE, null);
+            folder.open(OpenMode.READ_WRITE);
             fail();
         } catch (MessagingException expected) {
         }
@@ -1164,7 +1466,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 getNextTag(true) + " oK [rEAD-wRITE]"
                 });
 
-        folder.open(OpenMode.READ_WRITE, null);
+        folder.open(OpenMode.READ_WRITE);
         assertTrue(folder.exists());
         assertEquals(1, folder.getMessageCount());
         assertEquals(OpenMode.READ_WRITE, folder.getMode());
@@ -1181,7 +1483,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 getNextTag(true) + " oK [rEAD-oNLY]"
                 });
 
-        folder.open(OpenMode.READ_WRITE, null);
+        folder.open(OpenMode.READ_WRITE);
         assertTrue(folder.exists());
         assertEquals(2, folder.getMessageCount());
         assertEquals(OpenMode.READ_ONLY, folder.getMode());
@@ -1194,7 +1496,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
                 getNextTag(true) + " oK selected"
                 });
 
-        folder.open(OpenMode.READ_WRITE, null);
+        folder.open(OpenMode.READ_WRITE);
         assertTrue(folder.exists());
         assertEquals(15, folder.getMessageCount());
         assertEquals(OpenMode.READ_WRITE, folder.getMode());
@@ -1255,31 +1557,239 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         assertFalse(folder.create(FolderType.HOLDS_MESSAGES));
     }
 
-    public void testCopy() throws Exception {
-        MockTransport mock = openAndInjectMockTransport();
-        setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+    private void setupCopyMessages(boolean withUidPlus) throws Exception {
+        mCopyMock = openAndInjectMockTransport();
+        setupOpenFolder(mCopyMock, new String[] {"* iD nIL", "oK"}, "rEAD-wRITE", withUidPlus);
+        mFolder.open(OpenMode.READ_WRITE);
 
-        Folder folderTo = mStore.getFolder("\u65E5\u672C\u8A9E");
-        Message[] messages = new Message[] {
-                mFolder.createMessage("11"),
-                mFolder.createMessage("12"),
-                };
+        mCopyToFolder = mStore.getFolder("\u65E5\u672C\u8A9E");
+        Message m1 = mFolder.createMessage("11");
+        m1.setMessageId("<4D8978AE.0000005D@m58.foo.com>");
+        Message m2 = mFolder.createMessage("12");
+        m2.setMessageId("<549373104MSOSI1:145OSIMS@bar.com>");
+        mCopyMessages = new Message[] { m1, m2 };
+    }
 
-        mock.expect(getNextTag(false) + " UID COPY 11\\,12 \\\"&ZeVnLIqe-\\\"",
+    /**
+     * Returns the pattern for the IMAP request to copy messages.
+     */
+    private String getCopyMessagesPattern() {
+        return getNextTag(false) + " UID COPY 11\\,12 \\\"&ZeVnLIqe-\\\"";
+    }
+
+    /**
+     * Returns the pattern for the IMAP request to search for messages based on Message-Id.
+     */
+    private String getSearchMessagesPattern(String messageId) {
+        return getNextTag(false) + " UID SEARCH HEADER Message-Id \"" + messageId + "\"";
+    }
+
+    /**
+     * Counts the number of times the callback methods are invoked.
+     */
+    private static class MessageUpdateCallbackCounter implements Folder.MessageUpdateCallbacks {
+        int messageNotFoundCalled;
+        int messageUidChangeCalled;
+
+        @Override
+        public void onMessageNotFound(Message message) {
+            ++messageNotFoundCalled;
+        }
+        @Override
+        public void onMessageUidChange(Message message, String newUid) {
+            ++messageUidChangeCalled;
+        }
+    }
+
+    // TODO Test additional degenerate cases; src msg not found, ...
+    // Golden case; successful copy with UIDCOPY result
+    public void testCopyMessages1() throws Exception {
+        setupCopyMessages(true);
+        mCopyMock.expect(getCopyMessagesPattern(),
                 new String[] {
-                getNextTag(true) + " oK copy completed"
+                    "* Ok COPY in progress",
+                    getNextTag(true) + " oK [COPYUID 777 11,12 45,46] UID COPY completed"
                 });
 
-        mFolder.copyMessages(messages, folderTo, null);
+        MessageUpdateCallbackCounter cb = new MessageUpdateCallbackCounter();
+        mFolder.copyMessages(mCopyMessages, mCopyToFolder, cb);
 
-        // TODO: Test NO response. (src message not found)
+        assertEquals(0, cb.messageNotFoundCalled);
+        assertEquals(2, cb.messageUidChangeCalled);
+    }
+
+    // Degenerate case; NO, un-tagged response works
+    public void testCopyMessages2() throws Exception {
+        setupCopyMessages(true);
+        mCopyMock.expect(getCopyMessagesPattern(),
+                new String[] {
+                    "* No Some error occured during the copy",
+                    getNextTag(true) + " oK [COPYUID 777 11,12 45,46] UID COPY completed"
+                });
+
+        MessageUpdateCallbackCounter cb = new MessageUpdateCallbackCounter();
+        mFolder.copyMessages(mCopyMessages, mCopyToFolder, cb);
+
+        assertEquals(0, cb.messageNotFoundCalled);
+        assertEquals(2, cb.messageUidChangeCalled);
+    }
+
+    // Degenerate case; NO, tagged response throws MessagingException
+    public void testCopyMessages3() throws Exception {
+        try {
+            setupCopyMessages(false);
+            mCopyMock.expect(getCopyMessagesPattern(),
+                    new String[] {
+                        getNextTag(true) + " No copy did not finish"
+                    });
+
+            mFolder.copyMessages(mCopyMessages, mCopyToFolder, null);
+
+            fail("MessagingException expected.");
+        } catch (MessagingException expected) {
+        }
+    }
+
+    // Degenerate case; BAD, un-tagged response throws MessagingException
+    public void testCopyMessages4() throws Exception {
+        try {
+            setupCopyMessages(true);
+            mCopyMock.expect(getCopyMessagesPattern(),
+                    new String[] {
+                        "* BAD failed for some reason",
+                        getNextTag(true) + " Ok copy completed"
+                    });
+
+            mFolder.copyMessages(mCopyMessages, mCopyToFolder, null);
+
+            fail("MessagingException expected.");
+        } catch (MessagingException expected) {
+        }
+    }
+
+    // Degenerate case; BAD, tagged response throws MessagingException
+    public void testCopyMessages5() throws Exception {
+        try {
+            setupCopyMessages(false);
+            mCopyMock.expect(getCopyMessagesPattern(),
+                    new String[] {
+                        getNextTag(true) + " BaD copy completed"
+                    });
+
+            mFolder.copyMessages(mCopyMessages, mCopyToFolder, null);
+
+            fail("MessagingException expected.");
+        } catch (MessagingException expected) {
+        }
+    }
+
+    // Golden case; successful copy getting UIDs via search
+    public void testCopyMessages6() throws Exception {
+        setupCopyMessages(false);
+        mCopyMock.expect(getCopyMessagesPattern(),
+                new String[] {
+                    getNextTag(true) + " oK UID COPY completed",
+                });
+        // New connection, so, we need to login again & the tag count gets reset
+        int saveTag = resetTag();
+        expectLogin(mCopyMock, new String[] {"* iD nIL", "oK"}, false);
+        // Select destination folder
+        expectSelect(mCopyMock, "&ZeVnLIqe-", "rEAD-wRITE");
+        // Perform searches
+        mCopyMock.expect(getSearchMessagesPattern("<4D8978AE.0000005D@m58.foo.com>"),
+                new String[] {
+                    "* SeArCh 777",
+                    getNextTag(true) + " oK UID SEARCH completed (1 msgs in 3.14159 secs)",
+                });
+        mCopyMock.expect(getSearchMessagesPattern("<549373104MSOSI1:145OSIMS@bar.com>"),
+                new String[] {
+                    "* sEaRcH 1818",
+                    getNextTag(true) + " oK UID SEARCH completed (1 msgs in 2.71828 secs)",
+                });
+        // Resume commands on the initial connection
+        resetTag(saveTag);
+        // Select the original folder
+        expectSelect(mCopyMock, FOLDER_ENCODED, "rEAD-wRITE");
+
+        MessageUpdateCallbackCounter cb = new MessageUpdateCallbackCounter();
+        mFolder.copyMessages(mCopyMessages, mCopyToFolder, cb);
+
+        assertEquals(0, cb.messageNotFoundCalled);
+        assertEquals(2, cb.messageUidChangeCalled);
+    }
+
+    // Degenerate case; searches turn up nothing
+    public void testCopyMessages7() throws Exception {
+        setupCopyMessages(false);
+        mCopyMock.expect(getCopyMessagesPattern(),
+                new String[] {
+                    getNextTag(true) + " oK UID COPY completed",
+                });
+        // New connection, so, we need to login again & the tag count gets reset
+        int saveTag = resetTag();
+        expectLogin(mCopyMock, new String[] {"* iD nIL", "oK"}, false);
+        // Select destination folder
+        expectSelect(mCopyMock, "&ZeVnLIqe-", "rEAD-wRITE");
+        // Perform searches
+        mCopyMock.expect(getSearchMessagesPattern("<4D8978AE.0000005D@m58.foo.com>"),
+                new String[] {
+                    "* SeArCh",
+                    getNextTag(true) + " oK UID SEARCH completed (0 msgs in 6.02214 secs)",
+                });
+        mCopyMock.expect(getSearchMessagesPattern("<549373104MSOSI1:145OSIMS@bar.com>"),
+                new String[] {
+                    "* sEaRcH",
+                    getNextTag(true) + " oK UID SEARCH completed (0 msgs in 2.99792 secs)",
+                });
+        // Resume commands on the initial connection
+        resetTag(saveTag);
+        // Select the original folder
+        expectSelect(mCopyMock, FOLDER_ENCODED, "rEAD-wRITE");
+
+        MessageUpdateCallbackCounter cb = new MessageUpdateCallbackCounter();
+        mFolder.copyMessages(mCopyMessages, mCopyToFolder, cb);
+
+        assertEquals(0, cb.messageNotFoundCalled);
+        assertEquals(0, cb.messageUidChangeCalled);
+    }
+
+    // Degenerate case; search causes an exception; must be eaten
+    public void testCopyMessages8() throws Exception {
+        setupCopyMessages(false);
+        mCopyMock.expect(getCopyMessagesPattern(),
+                new String[] {
+                    getNextTag(true) + " oK UID COPY completed",
+                });
+        // New connection, so, we need to login again & the tag count gets reset
+        int saveTag = resetTag();
+        expectLogin(mCopyMock, new String[] {"* iD nIL", "oK"}, false);
+        // Select destination folder
+        expectSelect(mCopyMock, "&ZeVnLIqe-", "rEAD-wRITE");
+        // Perform searches
+        mCopyMock.expect(getSearchMessagesPattern("<4D8978AE.0000005D@m58.foo.com>"),
+                new String[] {
+                    getNextTag(true) + " BaD search failed"
+                });
+        mCopyMock.expect(getSearchMessagesPattern("<549373104MSOSI1:145OSIMS@bar.com>"),
+                new String[] {
+                    getNextTag(true) + " BaD search failed"
+                });
+        // Resume commands on the initial connection
+        resetTag(saveTag);
+        // Select the original folder
+        expectSelect(mCopyMock, FOLDER_ENCODED, "rEAD-wRITE");
+
+        MessageUpdateCallbackCounter cb = new MessageUpdateCallbackCounter();
+        mFolder.copyMessages(mCopyMessages, mCopyToFolder, cb);
+
+        assertEquals(0, cb.messageNotFoundCalled);
+        assertEquals(0, cb.messageUidChangeCalled);
     }
 
     public void testGetUnreadMessageCount() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         mock.expect(getNextTag(false) + " STATUS \\\"" + FOLDER_ENCODED + "\\\" \\(UNSEEN\\)",
                 new String[] {
@@ -1293,7 +1803,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testExpunge() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         mock.expect(getNextTag(false) + " EXPUNGE",
                 new String[] {
@@ -1308,7 +1818,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testSetFlags() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         Message[] messages = new Message[] {
                 mFolder.createMessage("11"),
@@ -1337,7 +1847,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testSearchForUids() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         // Single results
         mock.expect(
@@ -1398,7 +1908,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testGetMessage() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         // Found
         mock.expect(
@@ -1422,7 +1932,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testGetMessages1() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         // Found
         mock.expect(
@@ -1451,7 +1961,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testGetMessages2() throws Exception {
         MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
 
         // No command will be sent
         checkMessageUids(new String[] {"3", "4", "5"},
@@ -1459,25 +1969,6 @@ public class ImapStoreUnitTests extends AndroidTestCase {
 
         checkMessageUids(new String[] {},
                 mFolder.getMessages(new String[] {}, null));
-    }
-
-    /**
-     * Test for getMessages(MessageRetrievalListener), which is the same as
-     * getMessages(String[] uids, MessageRetrievalListener) where uids == null.
-     */
-    public void testGetMessages3() throws Exception {
-        MockTransport mock = openAndInjectMockTransport();
-        setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
-
-        mock.expect(
-                getNextTag(false) + " UID SEARCH 1:\\* NOT DELETED",
-                new String[] {
-                    "* sEARCH 3 4 5",
-                getNextTag(true) + " OK success"
-                });
-        checkMessageUids(new String[] {"3", "4", "5"},
-                mFolder.getMessages(null));
     }
 
     private static void checkMessageUids(String[] expectedUids, Message[] actualMessages) {
@@ -1517,6 +2008,9 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         // con1 != con2
         assertNotSame(con1, con2);
 
+        // New connection, so, we need to login again & the tag count gets reset
+        int saveTag = resetTag();
+
         // Open con2
         expectLogin(mock);
         con2.open();
@@ -1529,6 +2023,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         assertEquals(1, mStore.getConnectionPoolForTest().size());
 
         // Get another connection.  Should get con1, after verifying the connection.
+        saveTag = resetTag(saveTag);
         mock.expect(getNextTag(false) + " NOOP", new String[] {getNextTag(true) + " oK success"});
 
         final ImapConnection con1b = mStore.getConnection();
@@ -1539,6 +2034,9 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         // Save con2.
         mStore.poolConnection(con2);
         assertEquals(1, mStore.getConnectionPoolForTest().size());
+
+        // Resume con2 tags ...
+        resetTag(saveTag);
 
         // Try to get connection, but this time, connection gets closed.
         mock.expect(getNextTag(false) + " NOOP", new String[] {getNextTag(true) + "* bYE bye"});
@@ -1557,7 +2055,8 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         expectLogin(mock);
         mStore.checkSettings();
 
-        expectLogin(mock, false, false,
+        resetTag();
+        expectLogin(mock, false, false, false,
                 new String[] {"* iD nIL", "oK"}, "nO authentication failed");
         try {
             mStore.checkSettings();
@@ -1591,7 +2090,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
             "* OK [UIDNEXT 449625]",
             "* NO [ALERT] Mailbox is at 98% of quota",
             getNextTag(true) + " OK [READ-WRITE] Completed"});
-        folder.open(OpenMode.READ_WRITE, null); // shouldn't crash.
+        folder.open(OpenMode.READ_WRITE); // shouldn't crash.
         assertEquals(6406, folder.getMessageCount());
     }
 
@@ -1601,7 +2100,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
     public void testFetchBodyStructureMalformed() throws Exception {
         final MockTransport mock = openAndInjectMockTransport();
         setupOpenFolder(mock);
-        mFolder.open(OpenMode.READ_WRITE, null);
+        mFolder.open(OpenMode.READ_WRITE);
         final Message message = mFolder.createMessage("1");
 
         final FetchProfile fp = new FetchProfile();
@@ -1641,20 +2140,21 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         expectLogin(mock);
 
         // List folders.
+        expectNoop(mock, true);
         mock.expect(getNextTag(false) + " LIST \"\" \"\\*\"",
                 new String[] {
-                "* LIST () \"/\" \"" + FOLDER_1 + "\"",
-                "* LIST () \"/\" \"" + FOLDER_2 + "\"",
-                getNextTag(true) + " OK SUCCESS"
-                });
-        final Folder[] folders = mStore.getPersonalNamespaces();
+            "* LIST () \"/\" \"" + FOLDER_1 + "\"",
+            "* LIST () \"/\" \"" + FOLDER_2 + "\"",
+            getNextTag(true) + " OK SUCCESS"
+        });
+        final Folder[] folders = mStore.updateFolders();
 
         ArrayList<String> list = new ArrayList<String>();
         for (Folder f : folders) {
             list.add(f.getName());
         }
         MoreAsserts.assertEquals(
-                new String[] {FOLDER_1, FOLDER_2, "INBOX"},
+                new String[] {"INBOX", FOLDER_2, FOLDER_1},
                 list.toArray(new String[0])
                 );
 
@@ -1668,8 +2168,8 @@ public class ImapStoreUnitTests extends AndroidTestCase {
             "* OK [UNSEEN 0]",
             "* OK [UIDNEXT 1]",
             getNextTag(true) + " OK [READ-WRITE] " + FOLDER_1});
-        folders[0].open(OpenMode.READ_WRITE, null);
-        folders[0].close(false);
+        folders[2].open(OpenMode.READ_WRITE);
+        folders[2].close(false);
 
         expectNoop(mock, true);
         mock.expect(getNextTag(false) + " SELECT \"" + FOLDER_2 + "\"", new String[] {
@@ -1680,7 +2180,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
             "* OK [UNSEEN 0]",
             "* OK [UIDNEXT 1]",
             getNextTag(true) + " OK [READ-WRITE] " + FOLDER_2});
-        folders[1].open(OpenMode.READ_WRITE, null);
+        folders[1].open(OpenMode.READ_WRITE);
         folders[1].close(false);
     }
 
@@ -1701,7 +2201,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
         try {
             final MockTransport mockTransport = openAndInjectMockTransport();
             setupOpenFolder(mockTransport);
-            mFolder.open(OpenMode.READ_WRITE, null);
+            mFolder.open(OpenMode.READ_WRITE);
 
             target.run(mockTransport);
 
@@ -1715,6 +2215,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testFetchIOException() throws Exception {
         runAndExpectMessagingException(new RunAndExpectMessagingExceptionTarget() {
+            @Override
             public void run(MockTransport mockTransport) throws Exception {
                 mockTransport.expectIOException();
 
@@ -1732,6 +2233,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testUnreadMessageCountIOException() throws Exception {
         runAndExpectMessagingException(new RunAndExpectMessagingExceptionTarget() {
+            @Override
             public void run(MockTransport mockTransport) throws Exception {
                 mockTransport.expectIOException();
 
@@ -1745,6 +2247,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testCopyMessagesIOException() throws Exception {
         runAndExpectMessagingException(new RunAndExpectMessagingExceptionTarget() {
+            @Override
             public void run(MockTransport mockTransport) throws Exception {
                 mockTransport.expectIOException();
 
@@ -1761,6 +2264,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testSearchForUidsIOException() throws Exception {
         runAndExpectMessagingException(new RunAndExpectMessagingExceptionTarget() {
+            @Override
             public void run(MockTransport mockTransport) throws Exception {
                 mockTransport.expectIOException();
 
@@ -1774,6 +2278,7 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testExpungeIOException() throws Exception {
         runAndExpectMessagingException(new RunAndExpectMessagingExceptionTarget() {
+            @Override
             public void run(MockTransport mockTransport) throws Exception {
                 mockTransport.expectIOException();
 
@@ -1787,11 +2292,84 @@ public class ImapStoreUnitTests extends AndroidTestCase {
      */
     public void testOpenIOException() throws Exception {
         runAndExpectMessagingException(new RunAndExpectMessagingExceptionTarget() {
+            @Override
             public void run(MockTransport mockTransport) throws Exception {
                 mockTransport.expectIOException();
                 final Folder folder = mStore.getFolder("test");
-                folder.open(OpenMode.READ_WRITE, null);
+                folder.open(OpenMode.READ_WRITE);
             }
         });
+    }
+
+    /** Creates a folder & mailbox */
+    private ImapFolder createFolder(long id, String displayName, String serverId, char delimiter) {
+        ImapFolder folder = new ImapFolder(null, serverId);
+        Mailbox mailbox = new Mailbox();
+        mailbox.mId = id;
+        mailbox.mDisplayName = displayName;
+        mailbox.mServerId = serverId;
+        mailbox.mDelimiter = delimiter;
+        mailbox.mFlags = 0xAAAAAAA8;
+        folder.mMailbox = mailbox;
+        return folder;
+    }
+
+    /** Tests creating folder hierarchies */
+    public void testCreateHierarchy() {
+        HashMap<String, ImapFolder> testMap = new HashMap<String, ImapFolder>();
+
+        // Create hierarchy
+        //   |-INBOX
+        //   |  +-b
+        //   |-a
+        //   |  |-b
+        //   |  |-c
+        //   |  +-d
+        //   |    +-b
+        //   |      +-b
+        //   +-g
+        ImapFolder[] folders = {
+            createFolder(1L, "INBOX", "INBOX", '/'),
+            createFolder(2L, "b", "INBOX/b", '/'),
+            createFolder(3L, "a", "a", '/'),
+            createFolder(4L, "b", "a/b", '/'),
+            createFolder(5L, "c", "a/c", '/'),
+            createFolder(6L, "d", "a/d", '/'),
+            createFolder(7L, "b", "a/d/b", '/'),
+            createFolder(8L, "b", "a/d/b/b", '/'),
+            createFolder(9L, "g", "g", '/'),
+        };
+        for (ImapFolder folder : folders) {
+            testMap.put(folder.getName(), folder);
+        }
+
+        ImapStore.createHierarchy(testMap);
+        // 'INBOX'
+        assertEquals(-1L, folders[0].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAAB, folders[0].mMailbox.mFlags);
+        // 'INBOX/b'
+        assertEquals(1L, folders[1].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAA8, folders[1].mMailbox.mFlags);
+        // 'a'
+        assertEquals(-1L, folders[2].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAAB, folders[2].mMailbox.mFlags);
+        // 'a/b'
+        assertEquals(3L, folders[3].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAA8, folders[3].mMailbox.mFlags);
+        // 'a/c'
+        assertEquals(3L, folders[4].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAA8, folders[4].mMailbox.mFlags);
+        // 'a/d'
+        assertEquals(3L, folders[5].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAAB, folders[5].mMailbox.mFlags);
+        // 'a/d/b'
+        assertEquals(6L, folders[6].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAAB, folders[6].mMailbox.mFlags);
+        // 'a/d/b/b'
+        assertEquals(7L, folders[7].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAA8, folders[7].mMailbox.mFlags);
+        // 'g'
+        assertEquals(-1L, folders[8].mMailbox.mParentKey);
+        assertEquals(0xAAAAAAA8, folders[8].mMailbox.mFlags);
     }
 }

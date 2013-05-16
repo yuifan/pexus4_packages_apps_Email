@@ -17,6 +17,7 @@
 package com.android.email;
 
 import com.android.email.activity.setup.AccountSettingsUtils.Provider;
+import com.android.emailcommon.Logging;
 
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
@@ -25,8 +26,6 @@ import android.os.Bundle;
 import android.util.Log;
 
 import java.lang.reflect.Method;
-import java.net.URI;
-import java.net.URISyntaxException;
 
 /**
  * A bridge class to the email vendor policy apk.
@@ -78,7 +77,7 @@ public class VendorPolicyLoader {
      */
     public static void injectPolicyForTest(Context context, String apkPackageName, Class<?> clazz) {
         String name = clazz.getName();
-        Log.d(Email.LOG_TAG, String.format("Using policy: package=%s name=%s",
+        Log.d(Logging.LOG_TAG, String.format("Using policy: package=%s name=%s",
                 apkPackageName, name));
         sInstance = new VendorPolicyLoader(context, apkPackageName, name, true);
     }
@@ -120,10 +119,10 @@ public class VendorPolicyLoader {
             // Package not found -- it's okay - there's no policy .apk found, which is OK
         } catch (ClassNotFoundException e) {
             // Class not found -- probably not OK, but let's not crash here
-            Log.w(Email.LOG_TAG, "VendorPolicyLoader: " + e);
+            Log.w(Logging.LOG_TAG, "VendorPolicyLoader: " + e);
         } catch (NoSuchMethodException e) {
             // Method not found -- probably not OK, but let's not crash here
-            Log.w(Email.LOG_TAG, "VendorPolicyLoader: " + e);
+            Log.w(Logging.LOG_TAG, "VendorPolicyLoader: " + e);
         }
         mPolicyMethod = method;
     }
@@ -150,7 +149,7 @@ public class VendorPolicyLoader {
             try {
                 ret = (Bundle) mPolicyMethod.invoke(null, policy, args);
             } catch (Exception e) {
-                Log.w(Email.LOG_TAG, "VendorPolicyLoader", e);
+                Log.w(Logging.LOG_TAG, "VendorPolicyLoader", e);
             }
         }
         return (ret != null) ? ret : Bundle.EMPTY;
@@ -218,20 +217,16 @@ public class VendorPolicyLoader {
         params.putString(FIND_PROVIDER, domain);
         Bundle out = getPolicy(FIND_PROVIDER, params);
         if (out != null && !out.isEmpty()) {
-            try {
-                Provider p = new Provider();
-                p.id = null;
-                p.label = null;
-                p.domain = domain;
-                p.incomingUriTemplate = new URI(out.getString(FIND_PROVIDER_IN_URI));
-                p.incomingUsernameTemplate = out.getString(FIND_PROVIDER_IN_USER);
-                p.outgoingUriTemplate = new URI(out.getString(FIND_PROVIDER_OUT_URI));
-                p.outgoingUsernameTemplate = out.getString(FIND_PROVIDER_OUT_USER);
-                p.note = out.getString(FIND_PROVIDER_NOTE);
-                return p;
-            } catch (URISyntaxException e) {
-                Log.d(Email.LOG_TAG, "uri exception while vendor policy loads " + domain);
-            }
+            Provider p = new Provider();
+            p.id = null;
+            p.label = null;
+            p.domain = domain;
+            p.incomingUriTemplate = out.getString(FIND_PROVIDER_IN_URI);
+            p.incomingUsernameTemplate = out.getString(FIND_PROVIDER_IN_USER);
+            p.outgoingUriTemplate = out.getString(FIND_PROVIDER_OUT_URI);
+            p.outgoingUsernameTemplate = out.getString(FIND_PROVIDER_OUT_USER);
+            p.note = out.getString(FIND_PROVIDER_NOTE);
+            return p;
         }
         return null;
     }

@@ -16,26 +16,27 @@
 
 package com.android.email;
 
-import com.android.email.activity.AccountShortcutPicker;
-import com.android.email.activity.Debug;
-import com.android.email.activity.MessageCompose;
-import com.android.email.provider.EmailContent;
-import com.android.email.service.MailService;
-
 import android.app.Application;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
-import android.text.format.DateUtils;
 import android.util.Log;
 
-import java.io.File;
-import java.util.HashMap;
+import com.android.email.activity.MessageCompose;
+import com.android.email.activity.ShortcutPicker;
+import com.android.email.service.AttachmentDownloadService;
+import com.android.email.service.MailService;
+import com.android.email.widget.WidgetConfiguration;
+import com.android.emailcommon.Logging;
+import com.android.emailcommon.TempDirectory;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.service.EmailServiceProxy;
+import com.android.emailcommon.utility.EmailAsyncTask;
+import com.android.emailcommon.utility.Utility;
 
 public class Email extends Application {
-    public static final String LOG_TAG = "Email";
-
     /**
      * If this is enabled there will be additional logging information sent to
      * Log.d, including protocol dumps.
@@ -48,65 +49,17 @@ public class Email extends Application {
      *
      * TODO: rename this to sUserDebug, and rename LOGD below to DEBUG.
      */
-    public static boolean DEBUG = false;
+    public static boolean DEBUG;
+
+    // Exchange debugging flags (passed to Exchange, when available, via EmailServiceProxy)
+    public static boolean DEBUG_EXCHANGE;
+    public static boolean DEBUG_EXCHANGE_VERBOSE;
+    public static boolean DEBUG_EXCHANGE_FILE;
 
     /**
-     * If this is enabled than logging that normally hides sensitive information
-     * like passwords will show that information.
+     * If true, inhibit hardware graphics acceleration in UI (for a/b testing)
      */
-    public static boolean DEBUG_SENSITIVE = false;
-
-    /**
-     * Set this to 'true' to enable as much Email logging as possible.
-     * Do not check-in with it set to 'true'!
-     */
-    public static final boolean LOGD = false;
-
-    /**
-     * The MIME type(s) of attachments we're willing to send via attachments.
-     *
-     * Any attachments may be added via Intents with Intent.ACTION_SEND or ACTION_SEND_MULTIPLE.
-     */
-    public static final String[] ACCEPTABLE_ATTACHMENT_SEND_INTENT_TYPES = new String[] {
-        "*/*",
-    };
-
-    /**
-     * The MIME type(s) of attachments we're willing to send from the internal UI.
-     *
-     * NOTE:  At the moment it is not possible to open a chooser with a list of filter types, so
-     * the chooser is only opened with the first item in the list.
-     */
-    public static final String[] ACCEPTABLE_ATTACHMENT_SEND_UI_TYPES = new String[] {
-        "image/*",
-        "video/*",
-    };
-
-    /**
-     * The MIME type(s) of attachments we're willing to view.
-     */
-    public static final String[] ACCEPTABLE_ATTACHMENT_VIEW_TYPES = new String[] {
-        "*/*",
-    };
-
-    /**
-     * The MIME type(s) of attachments we're not willing to view.
-     */
-    public static final String[] UNACCEPTABLE_ATTACHMENT_VIEW_TYPES = new String[] {
-    };
-
-    /**
-     * The MIME type(s) of attachments we're willing to download to SD.
-     */
-    public static final String[] ACCEPTABLE_ATTACHMENT_DOWNLOAD_TYPES = new String[] {
-        "image/*",
-    };
-
-    /**
-     * The MIME type(s) of attachments we're not willing to download to SD.
-     */
-    public static final String[] UNACCEPTABLE_ATTACHMENT_DOWNLOAD_TYPES = new String[] {
-    };
+    public static boolean sDebugInhibitGraphicsAcceleration = false;
 
     /**
      * Specifies how many messages will be shown in a folder by default. This number is set
@@ -121,99 +74,48 @@ public class Email extends Application {
     public static final int VISIBLE_LIMIT_INCREMENT = 25;
 
     /**
-     * The maximum size of an attachment we're willing to download (either View or Save)
-     * Attachments that are base64 encoded (most) will be about 1.375x their actual size
-     * so we should probably factor that in. A 5MB attachment will generally be around
-     * 6.8MB downloaded but only 5MB saved.
-     */
-    public static final int MAX_ATTACHMENT_DOWNLOAD_SIZE = (5 * 1024 * 1024);
-
-    /**
-     * The maximum size of an attachment we're willing to upload (measured as stored on disk).
-     * Attachments that are base64 encoded (most) will be about 1.375x their actual size
-     * so we should probably factor that in. A 5MB attachment will generally be around
-     * 6.8MB uploaded.
-     */
-    public static final int MAX_ATTACHMENT_UPLOAD_SIZE = (5 * 1024 * 1024);
-
-    private static HashMap<Long, Long> sMailboxSyncTimes = new HashMap<Long, Long>();
-    private static final long UPDATE_INTERVAL = 5 * DateUtils.MINUTE_IN_MILLIS;
-
-    /**
      * This is used to force stacked UI to return to the "welcome" screen any time we change
      * the accounts list (e.g. deleting accounts in the Account Manager preferences.)
      */
     private static boolean sAccountsChangedNotification = false;
 
-    public static final String EXCHANGE_ACCOUNT_MANAGER_TYPE = "com.android.exchange";
+    private static String sMessageDecodeErrorString;
 
-    // The color chip resources and the RGB color values in the array below must be kept in sync
-    private static final int[] ACCOUNT_COLOR_CHIP_RES_IDS = new int[] {
-        R.drawable.appointment_indicator_leftside_1,
-        R.drawable.appointment_indicator_leftside_2,
-        R.drawable.appointment_indicator_leftside_3,
-        R.drawable.appointment_indicator_leftside_4,
-        R.drawable.appointment_indicator_leftside_5,
-        R.drawable.appointment_indicator_leftside_6,
-        R.drawable.appointment_indicator_leftside_7,
-        R.drawable.appointment_indicator_leftside_8,
-        R.drawable.appointment_indicator_leftside_9,
-    };
+    private static Thread sUiThread;
 
-    private static final int[] ACCOUNT_COLOR_CHIP_RGBS = new int[] {
-        0x71aea7,
-        0x621919,
-        0x18462f,
-        0xbf8e52,
-        0x001f79,
-        0xa8afc2,
-        0x6b64c4,
-        0x738359,
-        0x9d50a4,
-    };
-
-    private static File sTempDirectory;
-
-    /* package for testing */ static int getColorIndexFromAccountId(long accountId) {
-        // Account id is 1-based, so - 1.
-        // Use abs so that it won't possibly return negative.
-        return Math.abs((int) (accountId - 1) % ACCOUNT_COLOR_CHIP_RES_IDS.length);
-    }
-
-    public static int getAccountColorResourceId(long accountId) {
-        return ACCOUNT_COLOR_CHIP_RES_IDS[getColorIndexFromAccountId(accountId)];
-    }
-
-    public static int getAccountColor(long accountId) {
-        return ACCOUNT_COLOR_CHIP_RGBS[getColorIndexFromAccountId(accountId)];
-    }
-
-    public static void setTempDirectory(Context context) {
-        sTempDirectory = context.getCacheDir();
-    }
-
-    public static File getTempDirectory() {
-        if (sTempDirectory == null) {
-            throw new RuntimeException(
-                    "TempDirectory not set.  " +
-                    "If in a unit test, call Email.setTempDirectory(context) in setUp().");
-        }
-        return sTempDirectory;
+    /**
+     * Asynchronous version of {@link #setServicesEnabledSync(Context)}.  Use when calling from
+     * UI thread (or lifecycle entry points.)
+     *
+     * @param context
+     */
+    public static void setServicesEnabledAsync(final Context context) {
+        EmailAsyncTask.runAsyncParallel(new Runnable() {
+            @Override
+            public void run() {
+                setServicesEnabledSync(context);
+            }
+        });
     }
 
     /**
      * Called throughout the application when the number of accounts has changed. This method
      * enables or disables the Compose activity, the boot receiver and the service based on
-     * whether any accounts are configured.   Returns true if there are any accounts configured.
+     * whether any accounts are configured.
+     *
+     * Blocking call - do not call from UI/lifecycle threads.
+     *
+     * @param context
+     * @return true if there are any accounts configured.
      */
-    public static boolean setServicesEnabled(Context context) {
+    public static boolean setServicesEnabledSync(Context context) {
         Cursor c = null;
         try {
             c = context.getContentResolver().query(
-                    EmailContent.Account.CONTENT_URI,
-                    EmailContent.Account.ID_PROJECTION,
+                    Account.CONTENT_URI,
+                    Account.ID_PROJECTION,
                     null, null, null);
-            boolean enable = c.getCount() > 0;
+            boolean enable = c != null && c.getCount() > 0;
             setServicesEnabled(context, enable);
             return enable;
         } finally {
@@ -223,10 +125,11 @@ public class Email extends Application {
         }
     }
 
-    public static void setServicesEnabled(Context context, boolean enabled) {
+    private static void setServicesEnabled(Context context, boolean enabled) {
         PackageManager pm = context.getPackageManager();
-        if (!enabled && pm.getComponentEnabledSetting(new ComponentName(context, MailService.class)) ==
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
+        if (!enabled && pm.getComponentEnabledSetting(
+                new ComponentName(context, MailService.class)) ==
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
             /*
              * If no accounts now exist but the service is still enabled we're about to disable it
              * so we'll reschedule to kill off any existing alarms.
@@ -239,7 +142,7 @@ public class Email extends Application {
                     PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
                 PackageManager.DONT_KILL_APP);
         pm.setComponentEnabledSetting(
-                new ComponentName(context, AccountShortcutPicker.class),
+                new ComponentName(context, ShortcutPicker.class),
                 enabled ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED :
                     PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
                 PackageManager.DONT_KILL_APP);
@@ -248,29 +151,82 @@ public class Email extends Application {
                 enabled ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED :
                     PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
                 PackageManager.DONT_KILL_APP);
-        if (enabled && pm.getComponentEnabledSetting(new ComponentName(context, MailService.class)) ==
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
+        pm.setComponentEnabledSetting(
+                new ComponentName(context, AttachmentDownloadService.class),
+                enabled ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED :
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP);
+        if (enabled && pm.getComponentEnabledSetting(
+                new ComponentName(context, MailService.class)) ==
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
             /*
              * And now if accounts do exist then we've just enabled the service and we want to
              * schedule alarms for the new accounts.
              */
             MailService.actionReschedule(context);
         }
+
+        pm.setComponentEnabledSetting(new ComponentName(context, WidgetConfiguration.class),
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP);
+        // Start/stop the various services depending on whether there are any accounts
+        startOrStopService(enabled, context, new Intent(context, AttachmentDownloadService.class));
+        NotificationController.getInstance(context).watchForMessages(enabled);
+    }
+
+    /**
+     * Starts or stops the service as necessary.
+     * @param enabled If {@code true}, the service will be started. Otherwise, it will be stopped.
+     * @param context The context to manage the service with.
+     * @param intent The intent of the service to be managed.
+     */
+    private static void startOrStopService(boolean enabled, Context context, Intent intent) {
+        if (enabled) {
+            context.startService(intent);
+        } else {
+            context.stopService(intent);
+        }
     }
 
     @Override
     public void onCreate() {
         super.onCreate();
+        sUiThread = Thread.currentThread();
         Preferences prefs = Preferences.getPreferences(this);
         DEBUG = prefs.getEnableDebugLogging();
-        DEBUG_SENSITIVE = prefs.getEnableSensitiveLogging();
-        setTempDirectory(this);
+        sDebugInhibitGraphicsAcceleration = prefs.getInhibitGraphicsAcceleration();
+        enableStrictMode(prefs.getEnableStrictMode());
+        TempDirectory.setTempDirectory(this);
 
+        // Tie MailRefreshManager to the Controller.
+        RefreshManager.getInstance(this);
         // Reset all accounts to default visible window
         Controller.getInstance(this).resetVisibleLimits();
 
         // Enable logging in the EAS service, so it starts up as early as possible.
-        Debug.updateLoggingFlags(this);
+        updateLoggingFlags(this);
+
+        // Get a helper string used deep inside message decoders (which don't have context)
+        sMessageDecodeErrorString = getString(R.string.message_decode_error);
+
+        // Make sure all required services are running when the app is started (can prevent
+        // issues after an adb sync/install)
+        setServicesEnabledAsync(this);
+    }
+
+    /**
+     * Load enabled debug flags from the preferences and update the EAS debug flag.
+     */
+    public static void updateLoggingFlags(Context context) {
+        Preferences prefs = Preferences.getPreferences(context);
+        int debugLogging = prefs.getEnableDebugLogging() ? EmailServiceProxy.DEBUG_BIT : 0;
+        int verboseLogging =
+            prefs.getEnableExchangeLogging() ? EmailServiceProxy.DEBUG_VERBOSE_BIT : 0;
+        int fileLogging =
+            prefs.getEnableExchangeFileLogging() ? EmailServiceProxy.DEBUG_FILE_BIT : 0;
+        int enableStrictMode =
+            prefs.getEnableStrictMode() ? EmailServiceProxy.DEBUG_ENABLE_STRICT_MODE : 0;
+        int debugBits = debugLogging | verboseLogging | fileLogging | enableStrictMode;
+        Controller.getInstance(context).serviceLogging(debugBits);
     }
 
     /**
@@ -278,31 +234,7 @@ public class Email extends Application {
      * The calls to log() must be guarded with "if (Email.LOGD)" for performance reasons.
      */
     public static void log(String message) {
-        Log.d(LOG_TAG, message);
-    }
-
-    /**
-     * Update the time when the mailbox is refreshed
-     * @param mailboxId mailbox which need to be updated
-     */
-    public static void updateMailboxRefreshTime(long mailboxId) {
-        synchronized (sMailboxSyncTimes) {
-            sMailboxSyncTimes.put(mailboxId, System.currentTimeMillis());
-        }
-    }
-
-    /**
-     * Check if the mailbox is need to be refreshed
-     * @param mailboxId mailbox checked the need of refreshing
-     * @return the need of refreshing
-     */
-    public static boolean mailboxRequiresRefresh(long mailboxId) {
-        synchronized (sMailboxSyncTimes) {
-            return
-                !sMailboxSyncTimes.containsKey(mailboxId)
-                || (System.currentTimeMillis() - sMailboxSyncTimes.get(mailboxId)
-                        > UPDATE_INTERVAL);
-        }
+        Log.d(Logging.LOG_TAG, message);
     }
 
     /**
@@ -320,5 +252,23 @@ public class Email extends Application {
      */
     public static synchronized boolean getNotifyUiAccountsChanged() {
         return sAccountsChangedNotification;
+    }
+
+    public static void warnIfUiThread() {
+        if (Thread.currentThread().equals(sUiThread)) {
+            Log.w(Logging.LOG_TAG, "Method called on the UI thread", new Exception("STACK TRACE"));
+        }
+    }
+
+    /**
+     * Retrieve a simple string that can be used when message decoders encounter bad data.
+     * This is provided here because the protocol decoders typically don't have mContext.
+     */
+    public static String getMessageDecodeErrorString() {
+        return sMessageDecodeErrorString != null ? sMessageDecodeErrorString : "";
+    }
+
+    public static void enableStrictMode(boolean enabled) {
+        Utility.enableStrictMode(enabled);
     }
 }

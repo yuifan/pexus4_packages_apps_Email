@@ -16,36 +16,33 @@
 
 package com.android.email;
 
-import com.android.email.mail.Address;
-import com.android.email.mail.Body;
-import com.android.email.mail.Flag;
-import com.android.email.mail.Folder;
-import com.android.email.mail.Message;
-import com.android.email.mail.MessagingException;
-import com.android.email.mail.Part;
-import com.android.email.mail.Message.RecipientType;
-import com.android.email.mail.internet.MimeBodyPart;
-import com.android.email.mail.internet.MimeHeader;
-import com.android.email.mail.internet.MimeMessage;
-import com.android.email.mail.internet.MimeMultipart;
-import com.android.email.mail.internet.MimeUtility;
-import com.android.email.mail.internet.TextBody;
-import com.android.email.mail.store.LocalStore;
-import com.android.email.provider.AttachmentProvider;
-import com.android.email.provider.EmailContent;
-import com.android.email.provider.EmailContent.Attachment;
-import com.android.email.provider.EmailContent.AttachmentColumns;
-import com.android.email.provider.EmailContent.Mailbox;
-
-import org.apache.commons.io.IOUtils;
-
 import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
-import android.provider.OpenableColumns;
 import android.util.Log;
+
+import com.android.emailcommon.Logging;
+import com.android.emailcommon.internet.MimeBodyPart;
+import com.android.emailcommon.internet.MimeHeader;
+import com.android.emailcommon.internet.MimeMessage;
+import com.android.emailcommon.internet.MimeMultipart;
+import com.android.emailcommon.internet.MimeUtility;
+import com.android.emailcommon.internet.TextBody;
+import com.android.emailcommon.mail.Address;
+import com.android.emailcommon.mail.Flag;
+import com.android.emailcommon.mail.Message;
+import com.android.emailcommon.mail.Message.RecipientType;
+import com.android.emailcommon.mail.MessagingException;
+import com.android.emailcommon.mail.Part;
+import com.android.emailcommon.provider.EmailContent;
+import com.android.emailcommon.provider.EmailContent.Attachment;
+import com.android.emailcommon.provider.EmailContent.AttachmentColumns;
+import com.android.emailcommon.provider.Mailbox;
+import com.android.emailcommon.utility.AttachmentUtilities;
+
+import org.apache.commons.io.IOUtils;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -70,15 +67,6 @@ public class LegacyConversions {
     /* package */ static final String BODY_QUOTED_PART_REPLY = "quoted-reply";
     /* package */ static final String BODY_QUOTED_PART_FORWARD = "quoted-forward";
     /* package */ static final String BODY_QUOTED_PART_INTRO = "quoted-intro";
-
-    /**
-     * Standard columns for querying content providers
-     */
-    private static final String[] ATTACHMENT_META_COLUMNS_PROJECTION = {
-        OpenableColumns.DISPLAY_NAME,
-        OpenableColumns.SIZE
-    };
-    private static final int ATTACHMENT_META_COLUMNS_SIZE = 1;
 
     /**
      * Copy field-by-field from a "store" message to a "provider" message
@@ -108,6 +96,9 @@ public class LegacyConversions {
             localMessage.mSubject = subject;
         }
         localMessage.mFlagRead = message.isSet(Flag.SEEN);
+        if (message.isSet(Flag.ANSWERED)) {
+            localMessage.mFlags |= EmailContent.Message.FLAG_REPLIED_TO;
+        }
 
         // Keep the message in the "unloaded" state until it has (at least) a display name.
         // This prevents early flickering of empty messages in POP download.
@@ -160,115 +151,18 @@ public class LegacyConversions {
     }
 
     /**
-     * Copy body text (plain and/or HTML) from MimeMessage to provider Message
-     */
-    public static boolean updateBodyFields(EmailContent.Body body,
-            EmailContent.Message localMessage, ArrayList<Part> viewables)
-            throws MessagingException {
-
-        body.mMessageKey = localMessage.mId;
-
-        StringBuffer sbHtml = null;
-        StringBuffer sbText = null;
-        StringBuffer sbHtmlReply = null;
-        StringBuffer sbTextReply = null;
-        StringBuffer sbIntroText = null;
-
-        for (Part viewable : viewables) {
-            String text = MimeUtility.getTextFromPart(viewable);
-            String[] replyTags = viewable.getHeader(MimeHeader.HEADER_ANDROID_BODY_QUOTED_PART);
-            String replyTag = null;
-            if (replyTags != null && replyTags.length > 0) {
-                replyTag = replyTags[0];
-            }
-            // Deploy text as marked by the various tags
-            boolean isHtml = "text/html".equalsIgnoreCase(viewable.getMimeType());
-
-            if (replyTag != null) {
-                boolean isQuotedReply = BODY_QUOTED_PART_REPLY.equalsIgnoreCase(replyTag);
-                boolean isQuotedForward = BODY_QUOTED_PART_FORWARD.equalsIgnoreCase(replyTag);
-                boolean isQuotedIntro = BODY_QUOTED_PART_INTRO.equalsIgnoreCase(replyTag);
-
-                if (isQuotedReply || isQuotedForward) {
-                    if (isHtml) {
-                        sbHtmlReply = appendTextPart(sbHtmlReply, text);
-                    } else {
-                        sbTextReply = appendTextPart(sbTextReply, text);
-                    }
-                    // Set message flags as well
-                    localMessage.mFlags &= ~EmailContent.Message.FLAG_TYPE_MASK;
-                    localMessage.mFlags |= isQuotedReply
-                            ? EmailContent.Message.FLAG_TYPE_REPLY
-                            : EmailContent.Message.FLAG_TYPE_FORWARD;
-                    continue;
-                }
-                if (isQuotedIntro) {
-                    sbIntroText = appendTextPart(sbIntroText, text);
-                    continue;
-                }
-            }
-
-            // Most of the time, just process regular body parts
-            if (isHtml) {
-                sbHtml = appendTextPart(sbHtml, text);
-            } else {
-                sbText = appendTextPart(sbText, text);
-            }
-        }
-
-        // write the combined data to the body part
-        if (sbText != null && sbText.length() != 0) {
-            body.mTextContent = sbText.toString();
-        }
-        if (sbHtml != null && sbHtml.length() != 0) {
-            body.mHtmlContent = sbHtml.toString();
-        }
-        if (sbHtmlReply != null && sbHtmlReply.length() != 0) {
-            body.mHtmlReply = sbHtmlReply.toString();
-        }
-        if (sbTextReply != null && sbTextReply.length() != 0) {
-            body.mTextReply = sbTextReply.toString();
-        }
-        if (sbIntroText != null && sbIntroText.length() != 0) {
-            body.mIntroText = sbIntroText.toString();
-        }
-        return true;
-    }
-
-    /**
-     * Helper function to append text to a StringBuffer, creating it if necessary.
-     * Optimization:  The majority of the time we are *not* appending - we should have a path
-     * that deals with single strings.
-     */
-    private static StringBuffer appendTextPart(StringBuffer sb, String newText) {
-        if (newText == null) {
-            return sb;
-        }
-        else if (sb == null) {
-            sb = new StringBuffer(newText);
-        } else {
-            if (sb.length() > 0) {
-                sb.append('\n');
-            }
-            sb.append(newText);
-        }
-        return sb;
-    }
-
-    /**
      * Copy attachments from MimeMessage to provider Message.
      *
      * @param context a context for file operations
      * @param localMessage the attachments will be built against this message
      * @param attachments the attachments to add
-     * @param upgrading if true, we are upgrading a local account - handle attachments differently
      * @throws IOException
      */
     public static void updateAttachments(Context context, EmailContent.Message localMessage,
-            ArrayList<Part> attachments, boolean upgrading) throws MessagingException, IOException {
+            ArrayList<Part> attachments) throws MessagingException, IOException {
         localMessage.mAttachments = null;
         for (Part attachmentPart : attachments) {
-            addOneAttachment(context, localMessage, attachmentPart, upgrading);
+            addOneAttachment(context, localMessage, attachmentPart);
         }
     }
 
@@ -288,11 +182,10 @@ public class LegacyConversions {
      * @param context a context for file operations
      * @param localMessage the attachments will be built against this message
      * @param part a single attachment part from POP or IMAP
-     * @param upgrading true if upgrading a local account - handle attachments differently
      * @throws IOException
      */
     private static void addOneAttachment(Context context, EmailContent.Message localMessage,
-            Part part, boolean upgrading) throws MessagingException, IOException {
+            Part part) throws MessagingException, IOException {
 
         Attachment localAttachment = new Attachment();
 
@@ -304,53 +197,13 @@ public class LegacyConversions {
             name = MimeUtility.getHeaderParameter(contentDisposition, "filename");
         }
 
-        // Select the URI for the new attachments.  For attachments downloaded by the legacy
-        // IMAP/POP code, this is not determined yet, so is null (it will be rewritten below,
-        // or later, when the actual attachment file is created.)
-        //
-        // When upgrading older local accounts, the URI represents a local asset (e.g. a photo)
-        // so we need to preserve the URI.
-        // TODO This works for outgoing messages, where the URI does not change.  May need
-        // additional logic to handle the case of rewriting URI for received attachments.
-        Uri contentUri = null;
-        String contentUriString = null;
-        if (upgrading) {
-            Body body = part.getBody();
-            if (body instanceof LocalStore.LocalAttachmentBody) {
-                LocalStore.LocalAttachmentBody localBody = (LocalStore.LocalAttachmentBody) body;
-                contentUri = localBody.getContentUri();
-                if (contentUri != null) {
-                    contentUriString = contentUri.toString();
-                }
-            }
-        }
-
-        // Find size, if available, via a number of techniques:
+        // Incoming attachment: Try to pull size from disposition (if not downloaded yet)
         long size = 0;
-        if (upgrading) {
-            // If upgrading a legacy account, the size must be recaptured from the data source
-            if (contentUri != null) {
-                Cursor metadataCursor = context.getContentResolver().query(contentUri,
-                        ATTACHMENT_META_COLUMNS_PROJECTION, null, null, null);
-                if (metadataCursor != null) {
-                    try {
-                        if (metadataCursor.moveToFirst()) {
-                            size = metadataCursor.getInt(ATTACHMENT_META_COLUMNS_SIZE);
-                        }
-                    } finally {
-                        metadataCursor.close();
-                    }
-                }
-            }
-            // TODO: a downloaded legacy attachment - see if the above code works
-        } else {
-            // Incoming attachment: Try to pull size from disposition (if not downloaded yet)
-            String disposition = part.getDisposition();
-            if (disposition != null) {
-                String s = MimeUtility.getHeaderParameter(disposition, "size");
-                if (s != null) {
-                    size = Long.parseLong(s);
-                }
+        String disposition = part.getDisposition();
+        if (disposition != null) {
+            String s = MimeUtility.getHeaderParameter(disposition, "size");
+            if (s != null) {
+                size = Long.parseLong(s);
             }
         }
 
@@ -363,13 +216,14 @@ public class LegacyConversions {
         localAttachment.mMimeType = part.getMimeType();
         localAttachment.mSize = size;           // May be reset below if file handled
         localAttachment.mContentId = part.getContentId();
-        localAttachment.mContentUri = contentUriString;
+        localAttachment.mContentUri = null;     // Will be rewritten by saveAttachmentBody
         localAttachment.mMessageKey = localMessage.mId;
         localAttachment.mLocation = partId;
         localAttachment.mEncoding = "B";        // TODO - convert other known encodings
+        localAttachment.mAccountKey = localMessage.mAccountKey;
 
         if (DEBUG_ATTACHMENTS) {
-            Log.d(Email.LOG_TAG, "Add attachment " + localAttachment);
+            Log.d(Logging.LOG_TAG, "Add attachment " + localAttachment);
         }
 
         // To prevent duplication - do we already have a matching attachment?
@@ -383,7 +237,8 @@ public class LegacyConversions {
         boolean attachmentFoundInDb = false;
         try {
             while (cursor.moveToNext()) {
-                Attachment dbAttachment = new Attachment().restore(cursor);
+                Attachment dbAttachment = new Attachment();
+                dbAttachment.restore(cursor);
                 // We test each of the fields here (instead of in SQL) because they may be
                 // null, or may be strings.
                 if (stringNotEqual(dbAttachment.mFileName, localAttachment.mFileName)) continue;
@@ -394,7 +249,7 @@ public class LegacyConversions {
                 attachmentFoundInDb = true;
                 localAttachment.mId = dbAttachment.mId;
                 if (DEBUG_ATTACHMENTS) {
-                    Log.d(Email.LOG_TAG, "Skipped, found db attachment " + dbAttachment);
+                    Log.d(Logging.LOG_TAG, "Skipped, found db attachment " + dbAttachment);
                 }
                 break;
             }
@@ -408,9 +263,7 @@ public class LegacyConversions {
         }
 
         // If an attachment body was actually provided, we need to write the file now
-        if (!upgrading) {
-            saveAttachmentBody(context, part, localAttachment, localMessage.mAccountKey);
-        }
+        saveAttachmentBody(context, part, localAttachment, localMessage.mAccountKey);
 
         if (localMessage.mAttachments == null) {
             localMessage.mAttachments = new ArrayList<Attachment>();
@@ -440,11 +293,11 @@ public class LegacyConversions {
 
             InputStream in = part.getBody().getInputStream();
 
-            File saveIn = AttachmentProvider.getAttachmentDirectory(context, accountId);
+            File saveIn = AttachmentUtilities.getAttachmentDirectory(context, accountId);
             if (!saveIn.exists()) {
                 saveIn.mkdirs();
             }
-            File saveAs = AttachmentProvider.getAttachmentFilename(context, accountId,
+            File saveAs = AttachmentUtilities.getAttachmentFilename(context, accountId,
                     attachmentId);
             saveAs.createNewFile();
             FileOutputStream out = new FileOutputStream(saveAs);
@@ -453,7 +306,7 @@ public class LegacyConversions {
             out.close();
 
             // update the attachment with the extra information we now know
-            String contentUriString = AttachmentProvider.getAttachmentUri(
+            String contentUriString = AttachmentUtilities.getAttachmentUri(
                     accountId, attachmentId).toString();
 
             localAttachment.mSize = copySize;
@@ -506,14 +359,14 @@ public class LegacyConversions {
             addTextBodyPart(mp, "text/html", null,
                     EmailContent.Body.restoreBodyHtmlWithMessageId(context, localMessage.mId));
         } catch (RuntimeException rte) {
-            Log.d(Email.LOG_TAG, "Exception while reading html body " + rte.toString());
+            Log.d(Logging.LOG_TAG, "Exception while reading html body " + rte.toString());
         }
 
         try {
             addTextBodyPart(mp, "text/plain", null,
                     EmailContent.Body.restoreBodyTextWithMessageId(context, localMessage.mId));
         } catch (RuntimeException rte) {
-            Log.d(Email.LOG_TAG, "Exception while reading text body " + rte.toString());
+            Log.d(Logging.LOG_TAG, "Exception while reading text body " + rte.toString());
         }
 
         boolean isReply = (localMessage.mFlags & EmailContent.Message.FLAG_TYPE_REPLY) != 0;
@@ -527,7 +380,7 @@ public class LegacyConversions {
                 addTextBodyPart(mp, "text/plain", BODY_QUOTED_PART_INTRO,
                         EmailContent.Body.restoreIntroTextWithMessageId(context, localMessage.mId));
             } catch (RuntimeException rte) {
-                Log.d(Email.LOG_TAG, "Exception while reading text reply " + rte.toString());
+                Log.d(Logging.LOG_TAG, "Exception while reading text reply " + rte.toString());
             }
 
             String replyTag = isReply ? BODY_QUOTED_PART_REPLY : BODY_QUOTED_PART_FORWARD;
@@ -535,14 +388,14 @@ public class LegacyConversions {
                 addTextBodyPart(mp, "text/html", replyTag,
                         EmailContent.Body.restoreReplyHtmlWithMessageId(context, localMessage.mId));
             } catch (RuntimeException rte) {
-                Log.d(Email.LOG_TAG, "Exception while reading html reply " + rte.toString());
+                Log.d(Logging.LOG_TAG, "Exception while reading html reply " + rte.toString());
             }
 
             try {
                 addTextBodyPart(mp, "text/plain", replyTag,
                         EmailContent.Body.restoreReplyTextWithMessageId(context, localMessage.mId));
             } catch (RuntimeException rte) {
-                Log.d(Email.LOG_TAG, "Exception while reading text reply " + rte.toString());
+                Log.d(Logging.LOG_TAG, "Exception while reading text reply " + rte.toString());
             }
         }
 
@@ -581,135 +434,9 @@ public class LegacyConversions {
         mp.addBodyPart(bp);
     }
 
-    /**
-     * Conversion from provider account to legacy account
-     *
-     * Used for backup/restore.
-     *
-     * @param context application context
-     * @param fromAccount the provider account to be backed up (including transient hostauth's)
-     * @return a legacy Account object ready to be committed to preferences
-     */
-    /* package */ static Account makeLegacyAccount(Context context,
-            EmailContent.Account fromAccount) {
-        Account result = new Account(context);
-
-        result.setDescription(fromAccount.getDisplayName());
-        result.setEmail(fromAccount.getEmailAddress());
-        // fromAccount.mSyncKey - assume lost if restoring
-        result.setSyncWindow(fromAccount.getSyncLookback());
-        result.setAutomaticCheckIntervalMinutes(fromAccount.getSyncInterval());
-        // fromAccount.mHostAuthKeyRecv - id not saved; will be reassigned when restoring
-        // fromAccount.mHostAuthKeySend - id not saved; will be reassigned when restoring
-
-        // Provider Account flags, and how they are mapped.
-        //  FLAGS_NOTIFY_NEW_MAIL       -> mNotifyNewMail
-        //  FLAGS_VIBRATE_ALWAYS        -> mVibrate
-        //  FLAGS_VIBRATE_WHEN_SILENT   -> mVibrateWhenSilent
-        //  DELETE_POLICY_NEVER         -> mDeletePolicy
-        //  DELETE_POLICY_7DAYS
-        //  DELETE_POLICY_ON_DELETE
-        result.setNotifyNewMail(0 !=
-            (fromAccount.getFlags() & EmailContent.Account.FLAGS_NOTIFY_NEW_MAIL));
-        result.setVibrate(0 !=
-            (fromAccount.getFlags() & EmailContent.Account.FLAGS_VIBRATE_ALWAYS));
-        result.setVibrateWhenSilent(0 !=
-            (fromAccount.getFlags() & EmailContent.Account.FLAGS_VIBRATE_WHEN_SILENT));
-        result.setDeletePolicy(fromAccount.getDeletePolicy());
-
-        result.mUuid = fromAccount.getUuid();
-        result.setName(fromAccount.mSenderName);
-        result.setRingtone(fromAccount.mRingtoneUri);
-        result.mProtocolVersion = fromAccount.mProtocolVersion;
-        // int fromAccount.mNewMessageCount = will be reset on next sync
-        result.mSecurityFlags = fromAccount.mSecurityFlags;
-        result.mSignature = fromAccount.mSignature;
-
-        // Use the existing conversions from HostAuth <-> Uri
-        result.setStoreUri(fromAccount.getStoreUri(context));
-        result.setSenderUri(fromAccount.getSenderUri(context));
-
-        return result;
-    }
 
     /**
-     * Conversion from legacy account to provider account
-     *
-     * Used for backup/restore and for account migration.
-     *
-     * @param context application context
-     * @param fromAccount the legacy account to convert to modern format
-     * @return an Account ready to be committed to provider
-     */
-    public static EmailContent.Account makeAccount(Context context, Account fromAccount) {
-
-        EmailContent.Account result = new EmailContent.Account();
-
-        result.setDisplayName(fromAccount.getDescription());
-        result.setEmailAddress(fromAccount.getEmail());
-        result.mSyncKey = null;
-        result.setSyncLookback(fromAccount.getSyncWindow());
-        result.setSyncInterval(fromAccount.getAutomaticCheckIntervalMinutes());
-        // result.mHostAuthKeyRecv;     -- will be set when object is saved
-        // result.mHostAuthKeySend;     -- will be set when object is saved
-        int flags = 0;
-        if (fromAccount.isNotifyNewMail())  flags |= EmailContent.Account.FLAGS_NOTIFY_NEW_MAIL;
-        if (fromAccount.isVibrate())        flags |= EmailContent.Account.FLAGS_VIBRATE_ALWAYS;
-        if (fromAccount.isVibrateWhenSilent())
-            flags |= EmailContent.Account.FLAGS_VIBRATE_WHEN_SILENT;
-        result.setFlags(flags);
-        result.setDeletePolicy(fromAccount.getDeletePolicy());
-        // result.setDefaultAccount();  -- will be set by caller, if neededf
-        result.mCompatibilityUuid = fromAccount.getUuid();
-        result.setSenderName(fromAccount.getName());
-        result.setRingtone(fromAccount.getRingtone());
-        result.mProtocolVersion = fromAccount.mProtocolVersion;
-        result.mNewMessageCount = 0;
-        result.mSecurityFlags = fromAccount.mSecurityFlags;
-        result.mSecuritySyncKey = null;
-        result.mSignature = fromAccount.mSignature;
-
-        result.setStoreUri(context, fromAccount.getStoreUri());
-        result.setSenderUri(context, fromAccount.getSenderUri());
-
-        return result;
-    }
-
-    /**
-     * Conversion from legacy folder to provider mailbox.  Used for account migration.
-     * Note: Many mailbox fields are unused in IMAP & POP accounts.
-     *
-     * @param context application context
-     * @param toAccount the provider account that this folder will be associated with
-     * @param fromFolder the legacy folder to convert to modern format
-     * @return an Account ready to be committed to provider
-     */
-    public static EmailContent.Mailbox makeMailbox(Context context, EmailContent.Account toAccount,
-            Folder fromFolder) throws MessagingException {
-        EmailContent.Mailbox result = new EmailContent.Mailbox();
-
-        result.mDisplayName = fromFolder.getName();
-        // result.mServerId
-        // result.mParentServerId
-        result.mAccountKey = toAccount.mId;
-        result.mType = inferMailboxTypeFromName(context, fromFolder.getName());
-        // result.mDelimiter
-        // result.mSyncKey
-        // result.mSyncLookback
-        // result.mSyncInterval
-        result.mSyncTime = 0;
-        result.mUnreadCount = fromFolder.getUnreadMessageCount();
-        result.mFlagVisible = true;
-        result.mFlags = 0;
-        result.mVisibleLimit = Email.VISIBLE_LIMIT_DEFAULT;
-        // result.mSyncStatus
-
-        return result;
-    }
-
-    /**
-     * Infer mailbox type from mailbox name.  Used by MessagingController (for live folder sync)
-     * and for legacy account upgrades.
+     * Infer mailbox type from mailbox name.  Used by MessagingController (for live folder sync).
      */
     public static synchronized int inferMailboxTypeFromName(Context context, String mailboxName) {
         if (sServerMailboxNames.size() == 0) {
@@ -734,13 +461,13 @@ public class LegacyConversions {
                     Mailbox.TYPE_JUNK);
         }
         if (mailboxName == null || mailboxName.length() == 0) {
-            return EmailContent.Mailbox.TYPE_MAIL;
+            return Mailbox.TYPE_MAIL;
         }
         String lowerCaseName = mailboxName.toLowerCase();
         Integer type = sServerMailboxNames.get(lowerCaseName);
         if (type != null) {
             return type;
         }
-        return EmailContent.Mailbox.TYPE_MAIL;
+        return Mailbox.TYPE_MAIL;
     }
 }

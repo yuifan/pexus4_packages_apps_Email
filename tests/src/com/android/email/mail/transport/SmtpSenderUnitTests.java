@@ -16,29 +16,24 @@
 
 package com.android.email.mail.transport;
 
-import com.android.email.mail.Address;
-import com.android.email.mail.MessagingException;
-import com.android.email.mail.Transport;
-import com.android.email.provider.EmailProvider;
-import com.android.email.provider.EmailContent.Attachment;
-import com.android.email.provider.EmailContent.Body;
-import com.android.email.provider.EmailContent.Message;
-
-import org.apache.commons.io.IOUtils;
-
 import android.content.Context;
-import android.test.ProviderTestCase2;
+import android.test.AndroidTestCase;
 import android.test.suitebuilder.annotation.SmallTest;
 
-import java.io.ByteArrayInputStream;
-import java.io.File;
-import java.io.FileOutputStream;
+import com.android.email.DBTestHelper;
+import com.android.email.mail.Transport;
+import com.android.email.provider.EmailProvider;
+import com.android.emailcommon.mail.Address;
+import com.android.emailcommon.mail.MessagingException;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.EmailContent.Attachment;
+import com.android.emailcommon.provider.EmailContent.Body;
+import com.android.emailcommon.provider.EmailContent.Message;
+import com.android.emailcommon.provider.HostAuth;
+
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
-import java.util.regex.Pattern;
 
 /**
  * This is a series of unit tests for the SMTP Sender class.  These tests must be locally
@@ -48,7 +43,7 @@ import java.util.regex.Pattern;
  *   runtest -c com.android.email.mail.transport.SmtpSenderUnitTests email
  */
 @SmallTest
-public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
+public class SmtpSenderUnitTests extends AndroidTestCase {
 
     EmailProvider mProvider;
     Context mProviderContext;
@@ -62,36 +57,37 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
     private final static String TEST_STRING = "Hello, world";
     private final static String TEST_STRING_BASE64 = "SGVsbG8sIHdvcmxk";
 
-    public SmtpSenderUnitTests() {
-        super(EmailProvider.class, EmailProvider.EMAIL_AUTHORITY);
-    }
-
     /**
      * Setup code.  We generate a lightweight SmtpSender for testing.
      */
     @Override
     protected void setUp() throws Exception {
         super.setUp();
-        mProviderContext = getMockContext();
+        mProviderContext = DBTestHelper.ProviderContextSetupHelper.getProviderContext(
+                getContext());
         mContext = getContext();
-        
-        // These are needed so we can get at the inner classes
-        mSender = (SmtpSender) SmtpSender.newInstance(mProviderContext,
-                "smtp://user:password@server:999");
+
+        HostAuth testAuth = new HostAuth();
+        Account testAccount = new Account();
+
+        testAuth.setLogin("user", "password");
+        testAuth.setConnection("smtp", "server", 999);
+        testAccount.mHostAuthSend = testAuth;
+        mSender = (SmtpSender) SmtpSender.newInstance(testAccount, mProviderContext);
     }
 
     /**
      * Confirms simple non-SSL non-TLS login
      */
     public void testSimpleLogin() throws Exception {
-        
+
         MockTransport mockTransport = openAndInjectMockTransport();
-        
+
         // try to open it
         setupOpen(mockTransport, null);
         mSender.open();
     }
-    
+
     /**
      * TODO: Test with SSL negotiation (faked)
      * TODO: Test with SSL required but not supported
@@ -100,7 +96,7 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
      * TODO: Test other capabilities.
      * TODO: Test AUTH LOGIN
      */
-    
+
     /**
      * Test:  Open and send a single message (sunny day)
      */
@@ -146,119 +142,12 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
         message.save(mProviderContext);
 
         // Creates an attachment with a bogus file (so we get headers only)
-        Attachment attachment = setupSimpleAttachment(mProviderContext, message.mId, false);
+        Attachment attachment = setupSimpleAttachment(mProviderContext, message.mId);
         attachment.save(mProviderContext);
 
         expectSimpleMessage(mockTransport);
         mockTransport.expect("Content-Type: multipart/mixed; boundary=\".*");
         mockTransport.expect("");
-        mockTransport.expect("----.*");
-        expectSimpleAttachment(mockTransport, attachment);
-        mockTransport.expect("");
-        mockTransport.expect("----.*--");
-        mockTransport.expect("\r\n\\.", "250 2.0.0 kv2f1a00C02Rf8w3Vv mail accepted for delivery");
-
-        // Now trigger the transmission
-        mSender.sendMessage(message.mId);
-    }
-
-    /**
-     * Test:  Open and send a single message with an attachment (sunny day)
-     */
-    public void testSendMessageWithAttachment() throws MessagingException, IOException {
-        MockTransport mockTransport = openAndInjectMockTransport();
-
-        // Since SmtpSender.sendMessage() does a close then open, we need to preset for the open
-        mockTransport.expectClose();
-        setupOpen(mockTransport, null);
-
-        Message message = setupSimpleMessage();
-        message.save(mProviderContext);
-
-        // Creates an attachment with a real file
-        Attachment attachment = setupSimpleAttachment(mProviderContext, message.mId, true);
-        attachment.save(mProviderContext);
-
-        expectSimpleMessage(mockTransport);
-        mockTransport.expect("Content-Type: multipart/mixed; boundary=\".*");
-        mockTransport.expect("");
-        mockTransport.expect("----.*");
-        expectSimpleAttachment(mockTransport, attachment);
-        mockTransport.expect("");
-        mockTransport.expect("----.*--");
-        mockTransport.expect("\r\n\\.", "250 2.0.0 kv2f1a00C02Rf8w3Vv mail accepted for delivery");
-
-        // Now trigger the transmission
-        mSender.sendMessage(message.mId);
-    }
-
-    /**
-     * Test:  Open and send a single message with two attachments
-     */
-    public void testSendMessageWithTwoAttachments() throws MessagingException, IOException {
-        MockTransport mockTransport = openAndInjectMockTransport();
-
-        // Since SmtpSender.sendMessage() does a close then open, we need to preset for the open
-        mockTransport.expectClose();
-        setupOpen(mockTransport, null);
-
-        Message message = setupSimpleMessage();
-        message.save(mProviderContext);
-
-        // Creates an attachment with a real file
-        Attachment attachment = setupSimpleAttachment(mProviderContext, message.mId, true);
-        attachment.save(mProviderContext);
-
-        // Creates an attachment with a real file
-        Attachment attachment2 = setupSimpleAttachment(mProviderContext, message.mId, true);
-        attachment2.save(mProviderContext);
-
-        expectSimpleMessage(mockTransport);
-        mockTransport.expect("Content-Type: multipart/mixed; boundary=\".*");
-        mockTransport.expect("");
-        mockTransport.expect("----.*");
-        expectSimpleAttachment(mockTransport, attachment);
-        mockTransport.expect("");
-        mockTransport.expect("----.*");
-        expectSimpleAttachment(mockTransport, attachment2);
-        mockTransport.expect("");
-        mockTransport.expect("----.*--");
-        mockTransport.expect("\r\n\\.", "250 2.0.0 kv2f1a00C02Rf8w3Vv mail accepted for delivery");
-
-        // Now trigger the transmission
-        mSender.sendMessage(message.mId);
-    }
-
-    /**
-     * Test:  Open and send a single message with body & attachment (sunny day)
-     */
-    public void testSendMessageWithBodyAndAttachment() throws MessagingException, IOException {
-        MockTransport mockTransport = openAndInjectMockTransport();
-
-        // Since SmtpSender.sendMessage() does a close then open, we need to preset for the open
-        mockTransport.expectClose();
-        setupOpen(mockTransport, null);
-
-        Message message = setupSimpleMessage();
-        message.save(mProviderContext);
-
-        Body body = new Body();
-        body.mMessageKey = message.mId;
-        body.mTextContent = TEST_STRING;
-        body.save(mProviderContext);
-
-        Attachment attachment = setupSimpleAttachment(mProviderContext, message.mId, true);
-        attachment.save(mProviderContext);
-
-        // prepare for the message traffic we'll see
-        expectSimpleMessage(mockTransport);
-        mockTransport.expect("Content-Type: multipart/mixed; boundary=\".*");
-        mockTransport.expect("");
-        mockTransport.expect("----.*");
-        mockTransport.expect("Content-Type: text/plain; charset=utf-8");
-        mockTransport.expect("Content-Transfer-Encoding: base64");
-        mockTransport.expect("");
-        mockTransport.expect(TEST_STRING_BASE64);
         mockTransport.expect("----.*");
         expectSimpleAttachment(mockTransport, attachment);
         mockTransport.expect("");
@@ -285,9 +174,9 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
      * Prepare to receive a simple message (see setupSimpleMessage)
      */
     private void expectSimpleMessage(MockTransport mockTransport) {
-        mockTransport.expect("MAIL FROM: <Jones@Registry.Org>", 
+        mockTransport.expect("MAIL FROM:<Jones@Registry.Org>",
                 "250 2.1.0 <Jones@Registry.Org> sender ok");
-        mockTransport.expect("RCPT TO: <Smith@Registry.Org>",
+        mockTransport.expect("RCPT TO:<Smith@Registry.Org>",
                 "250 2.1.5 <Smith@Registry.Org> recipient ok");
         mockTransport.expect("DATA", "354 enter mail, end with . on a line by itself");
         mockTransport.expect("Date: .*");
@@ -300,8 +189,7 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
     /**
      * Prepare to send a simple attachment
      */
-    private Attachment setupSimpleAttachment(Context context, long messageId, boolean withBody)
-            throws IOException {
+    private Attachment setupSimpleAttachment(Context context, long messageId) {
         Attachment attachment = new Attachment();
         attachment.mFileName = "the file.jpg";
         attachment.mMimeType = "image/jpg";
@@ -311,17 +199,6 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
         attachment.mMessageKey = messageId;
         attachment.mLocation = null;
         attachment.mEncoding = null;
-
-        if (withBody) {
-            // Is there an easier way to set up a temp file?
-            InputStream inStream = new ByteArrayInputStream(TEST_STRING.getBytes());
-            File cacheDir = context.getCacheDir();
-            File tmpFile = File.createTempFile("setupSimpleAttachment", "tmp", cacheDir);
-            OutputStream outStream = new FileOutputStream(tmpFile);
-
-            IOUtils.copy(inStream, outStream);
-            attachment.mContentUri = "file://" + tmpFile.getAbsolutePath();
-        }
 
         return attachment;
     }
@@ -347,14 +224,14 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
      */
     public void testEmptyLineResponse() throws Exception {
         MockTransport mockTransport = openAndInjectMockTransport();
-        
+
         // Since SmtpSender.sendMessage() does a close then open, we need to preset for the open
         mockTransport.expectClose();
-        
+
         // Load up just the bare minimum to expose the error
         mockTransport.expect(null, "220 MockTransport 2000 Ready To Assist You Peewee");
-        mockTransport.expect("EHLO " + Pattern.quote(LOCAL_ADDRESS), "");
-        
+        mockTransport.expectLiterally("EHLO [" + LOCAL_ADDRESS + "]", null);
+
         // Now trigger the transmission
         // Note, a null message is sufficient here, as we won't even get past open()
         try {
@@ -365,7 +242,7 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
             // TODO maybe expect a particular exception?
         }
     }
-    
+
     /**
      * Set up a basic MockTransport. open it, and inject it into mStore
      */
@@ -377,10 +254,10 @@ public class SmtpSenderUnitTests extends ProviderTestCase2<EmailProvider> {
         mockTransport.setMockLocalAddress(InetAddress.getByName(LOCAL_ADDRESS));
         return mockTransport;
     }
-    
+
     /**
      * Helper which stuffs the mock with enough strings to satisfy a call to SmtpSender.open()
-     * 
+     *
      * @param mockTransport the mock transport we're using
      * @param capabilities if non-null, comma-separated list of capabilities
      */

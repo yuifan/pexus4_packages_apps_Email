@@ -16,70 +16,62 @@
 
 package com.android.email;
 
-import com.android.email.activity.setup.AccountSecurity;
-import com.android.email.provider.EmailContent;
-import com.android.email.provider.EmailContent.Account;
-import com.android.email.provider.EmailContent.AccountColumns;
-import com.android.email.service.MailService;
-
-import android.app.Notification;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
+import android.app.admin.DeviceAdminInfo;
 import android.app.admin.DeviceAdminReceiver;
 import android.app.admin.DevicePolicyManager;
 import android.content.ComponentName;
+import android.content.ContentProviderOperation;
 import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.OperationApplicationException;
 import android.database.Cursor;
-import android.media.AudioManager;
-import android.net.Uri;
+import android.os.Build;
+import android.os.RemoteException;
 import android.util.Log;
+
+import com.android.email.service.EmailBroadcastProcessorService;
+import com.android.emailcommon.Logging;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.EmailContent;
+import com.android.emailcommon.provider.EmailContent.AccountColumns;
+import com.android.emailcommon.provider.EmailContent.PolicyColumns;
+import com.android.emailcommon.provider.Policy;
+import com.android.emailcommon.utility.TextUtilities;
+import com.android.emailcommon.utility.Utility;
+import com.google.common.annotations.VisibleForTesting;
+
+import java.util.ArrayList;
 
 /**
  * Utility functions to support reading and writing security policies, and handshaking the device
  * into and out of various security states.
  */
 public class SecurityPolicy {
-
+    private static final String TAG = "Email/SecurityPolicy";
     private static SecurityPolicy sInstance = null;
     private Context mContext;
     private DevicePolicyManager mDPM;
-    private ComponentName mAdminName;
-    private PolicySet mAggregatePolicy;
+    private final ComponentName mAdminName;
+    private Policy mAggregatePolicy;
 
-    /* package */ static final PolicySet NO_POLICY_SET =
-            new PolicySet(0, PolicySet.PASSWORD_MODE_NONE, 0, 0, false);
+    // Messages used for DevicePolicyManager callbacks
+    private static final int DEVICE_ADMIN_MESSAGE_ENABLED = 1;
+    private static final int DEVICE_ADMIN_MESSAGE_DISABLED = 2;
+    private static final int DEVICE_ADMIN_MESSAGE_PASSWORD_CHANGED = 3;
+    private static final int DEVICE_ADMIN_MESSAGE_PASSWORD_EXPIRING = 4;
 
-    /**
-     * This projection on Account is for scanning/reading 
-     */
-    private static final String[] ACCOUNT_SECURITY_PROJECTION = new String[] {
-        AccountColumns.ID, AccountColumns.SECURITY_FLAGS
-    };
-    private static final int ACCOUNT_SECURITY_COLUMN_FLAGS = 1;
-    // Note, this handles the NULL case to deal with older accounts where the column was added
-    private static final String WHERE_ACCOUNT_SECURITY_NONZERO =
-        Account.SECURITY_FLAGS + " IS NOT NULL AND " + Account.SECURITY_FLAGS + "!=0";
-
-    /**
-     * This projection on Account is for clearing the "security hold" column.  Also includes
-     * the security flags column, so we can use it for selecting.
-     */
-    private static final String[] ACCOUNT_FLAGS_PROJECTION = new String[] {
-        AccountColumns.ID, AccountColumns.FLAGS, AccountColumns.SECURITY_FLAGS
-    };
-    private static final int ACCOUNT_FLAGS_COLUMN_ID = 0;
-    private static final int ACCOUNT_FLAGS_COLUMN_FLAGS = 1;
+    private static final String HAS_PASSWORD_EXPIRATION =
+            PolicyColumns.PASSWORD_EXPIRATION_DAYS + ">0";
 
     /**
      * Get the security policy instance
      */
     public synchronized static SecurityPolicy getInstance(Context context) {
         if (sInstance == null) {
-            sInstance = new SecurityPolicy(context);
+            sInstance = new SecurityPolicy(context.getApplicationContext());
         }
         return sInstance;
     }
@@ -88,10 +80,11 @@ public class SecurityPolicy {
      * Private constructor (one time only)
      */
     private SecurityPolicy(Context context) {
-        mContext = context;
+        mContext = context.getApplicationContext();
         mDPM = null;
         mAdminName = new ComponentName(context, PolicyAdmin.class);
         mAggregatePolicy = null;
+        setActivePolicies();
     }
 
     /**
@@ -110,59 +103,98 @@ public class SecurityPolicy {
      *  max password fails          take the min
      *  max screen lock time        take the min
      *  require remote wipe         take the max (logical or)
-     * 
+     *  password history            take the max (strongest mode)
+     *  password expiration         take the min (strongest mode)
+     *  password complex chars      take the max (strongest mode)
+     *  encryption                  take the max (logical or)
+     *
      * @return a policy representing the strongest aggregate.  If no policy sets are defined,
      * a lightweight "nothing required" policy will be returned.  Never null.
      */
-    /* package */ PolicySet computeAggregatePolicy() {
+    @VisibleForTesting
+    Policy computeAggregatePolicy() {
         boolean policiesFound = false;
+        Policy ap = new Policy();
+        ap.mPasswordMinLength = Integer.MIN_VALUE;
+        ap.mPasswordMode = Integer.MIN_VALUE;
+        ap.mPasswordMaxFails = Integer.MAX_VALUE;
+        ap.mPasswordHistory = Integer.MIN_VALUE;
+        ap.mPasswordExpirationDays = Integer.MAX_VALUE;
+        ap.mPasswordComplexChars = Integer.MIN_VALUE;
+        ap.mMaxScreenLockTime = Integer.MAX_VALUE;
+        ap.mRequireRemoteWipe = false;
+        ap.mRequireEncryption = false;
 
-        int minPasswordLength = Integer.MIN_VALUE;
-        int passwordMode = Integer.MIN_VALUE;
-        int maxPasswordFails = Integer.MAX_VALUE;
-        int maxScreenLockTime = Integer.MAX_VALUE;
-        boolean requireRemoteWipe = false;
+        // This can never be supported at this time. It exists only for historic reasons where
+        // this was able to be supported prior to the introduction of proper removable storage
+        // support for external storage.
+        ap.mRequireEncryptionExternal = false;
 
-        Cursor c = mContext.getContentResolver().query(Account.CONTENT_URI,
-                ACCOUNT_SECURITY_PROJECTION, WHERE_ACCOUNT_SECURITY_NONZERO, null, null);
+        Cursor c = mContext.getContentResolver().query(Policy.CONTENT_URI,
+                Policy.CONTENT_PROJECTION, null, null, null);
+        Policy policy = new Policy();
         try {
             while (c.moveToNext()) {
-                int flags = c.getInt(ACCOUNT_SECURITY_COLUMN_FLAGS);
-                if (flags != 0) {
-                    PolicySet p = new PolicySet(flags);
-                    minPasswordLength = Math.max(p.mMinPasswordLength, minPasswordLength);
-                    passwordMode  = Math.max(p.mPasswordMode, passwordMode);
-                    if (p.mMaxPasswordFails > 0) {
-                        maxPasswordFails = Math.min(p.mMaxPasswordFails, maxPasswordFails);
-                    }
-                    if (p.mMaxScreenLockTime > 0) {
-                        maxScreenLockTime = Math.min(p.mMaxScreenLockTime, maxScreenLockTime);
-                    }
-                    requireRemoteWipe |= p.mRequireRemoteWipe;
-                    policiesFound = true;
+                policy.restore(c);
+                if (Email.DEBUG) {
+                    Log.d(TAG, "Aggregate from: " + policy);
                 }
+                ap.mPasswordMinLength = Math.max(policy.mPasswordMinLength, ap.mPasswordMinLength);
+                ap.mPasswordMode  = Math.max(policy.mPasswordMode, ap.mPasswordMode);
+                if (policy.mPasswordMaxFails > 0) {
+                    ap.mPasswordMaxFails =
+                            Math.min(policy.mPasswordMaxFails, ap.mPasswordMaxFails);
+                }
+                if (policy.mMaxScreenLockTime > 0) {
+                    ap.mMaxScreenLockTime =
+                            Math.min(policy.mMaxScreenLockTime, ap.mMaxScreenLockTime);
+                }
+                if (policy.mPasswordHistory > 0) {
+                    ap.mPasswordHistory =
+                            Math.max(policy.mPasswordHistory, ap.mPasswordHistory);
+                }
+                if (policy.mPasswordExpirationDays > 0) {
+                    ap.mPasswordExpirationDays =
+                            Math.min(policy.mPasswordExpirationDays, ap.mPasswordExpirationDays);
+                }
+                if (policy.mPasswordComplexChars > 0) {
+                    ap.mPasswordComplexChars =
+                            Math.max(policy.mPasswordComplexChars, ap.mPasswordComplexChars);
+                }
+                ap.mRequireRemoteWipe |= policy.mRequireRemoteWipe;
+                ap.mRequireEncryption |= policy.mRequireEncryption;
+                ap.mDontAllowCamera |= policy.mDontAllowCamera;
+                policiesFound = true;
             }
         } finally {
             c.close();
         }
         if (policiesFound) {
             // final cleanup pass converts any untouched min/max values to zero (not specified)
-            if (minPasswordLength == Integer.MIN_VALUE) minPasswordLength = 0;
-            if (passwordMode == Integer.MIN_VALUE) passwordMode = 0;
-            if (maxPasswordFails == Integer.MAX_VALUE) maxPasswordFails = 0;
-            if (maxScreenLockTime == Integer.MAX_VALUE) maxScreenLockTime = 0;
-
-            return new PolicySet(minPasswordLength, passwordMode, maxPasswordFails,
-                    maxScreenLockTime, requireRemoteWipe);
-        } else {
-            return NO_POLICY_SET;
+            if (ap.mPasswordMinLength == Integer.MIN_VALUE) ap.mPasswordMinLength = 0;
+            if (ap.mPasswordMode == Integer.MIN_VALUE) ap.mPasswordMode = 0;
+            if (ap.mPasswordMaxFails == Integer.MAX_VALUE) ap.mPasswordMaxFails = 0;
+            if (ap.mMaxScreenLockTime == Integer.MAX_VALUE) ap.mMaxScreenLockTime = 0;
+            if (ap.mPasswordHistory == Integer.MIN_VALUE) ap.mPasswordHistory = 0;
+            if (ap.mPasswordExpirationDays == Integer.MAX_VALUE)
+                ap.mPasswordExpirationDays = 0;
+            if (ap.mPasswordComplexChars == Integer.MIN_VALUE)
+                ap.mPasswordComplexChars = 0;
+            if (Email.DEBUG) {
+                Log.d(TAG, "Calculated Aggregate: " + ap);
+            }
+            return ap;
         }
+        if (Email.DEBUG) {
+            Log.d(TAG, "Calculated Aggregate: no policy");
+        }
+        return Policy.NO_POLICY;
     }
 
     /**
      * Return updated aggregate policy, from cached value if possible
      */
-    public synchronized PolicySet getAggregatePolicy() {
+    public synchronized Policy getAggregatePolicy() {
         if (mAggregatePolicy == null) {
             mAggregatePolicy = computeAggregatePolicy();
         }
@@ -172,7 +204,7 @@ public class SecurityPolicy {
     /**
      * Get the dpm.  This mainly allows us to make some utility calls without it, for testing.
      */
-    private synchronized DevicePolicyManager getDPM() {
+    /* package */ synchronized DevicePolicyManager getDPM() {
         if (mDPM == null) {
             mDPM = (DevicePolicyManager) mContext.getSystemService(Context.DEVICE_POLICY_SERVICE);
         }
@@ -183,7 +215,7 @@ public class SecurityPolicy {
      * API: Report that policies may have been updated due to rewriting values in an Account.
      * @param accountId the account that has been updated, -1 if unknown/deleted
      */
-    public synchronized void updatePolicies(long accountId) {
+    public synchronized void policiesUpdated(long accountId) {
         mAggregatePolicy = null;
     }
 
@@ -194,9 +226,115 @@ public class SecurityPolicy {
      * rollbacks.
      */
     public void reducePolicies() {
-        updatePolicies(-1);
+        if (Email.DEBUG) {
+            Log.d(TAG, "reducePolicies");
+        }
+        policiesUpdated(-1);
         setActivePolicies();
     }
+
+    /**
+     * API: Query if the proposed set of policies are supported on the device.
+     *
+     * @param policy the polices that were requested
+     * @return boolean if supported
+     */
+    public boolean isSupported(Policy policy) {
+        // IMPLEMENTATION:  At this time, the only policy which might not be supported is
+        // encryption (which requires low-level systems support).  Other policies are fully
+        // supported by the framework and do not need to be checked.
+        if (policy.mRequireEncryption) {
+            int encryptionStatus = getDPM().getStorageEncryptionStatus();
+            if (encryptionStatus == DevicePolicyManager.ENCRYPTION_STATUS_UNSUPPORTED) {
+                return false;
+            }
+        }
+
+        // If we ever support devices that can't disable cameras for any reason, we should
+        // indicate as such in the mDontAllowCamera policy
+
+        return true;
+    }
+
+    /**
+     * API: Remove any unsupported policies
+     *
+     * This is used when we have a set of polices that have been requested, but the server
+     * is willing to allow unsupported policies to be considered optional.
+     *
+     * @param policy the polices that were requested
+     * @return the same PolicySet if all are supported;  A replacement PolicySet if any
+     *   unsupported policies were removed
+     */
+    public Policy clearUnsupportedPolicies(Policy policy) {
+        // IMPLEMENTATION:  At this time, the only policy which might not be supported is
+        // encryption (which requires low-level systems support).  Other policies are fully
+        // supported by the framework and do not need to be checked.
+        if (policy.mRequireEncryption) {
+            int encryptionStatus = getDPM().getStorageEncryptionStatus();
+            if (encryptionStatus == DevicePolicyManager.ENCRYPTION_STATUS_UNSUPPORTED) {
+                policy.mRequireEncryption = false;
+            }
+        }
+
+        // If we ever support devices that can't disable cameras for any reason, we should
+        // clear the mDontAllowCamera policy
+
+        return policy;
+    }
+
+    /**
+     * API: Query used to determine if a given policy is "active" (the device is operating at
+     * the required security level).
+     *
+     * @param policy the policies requested, or null to check aggregate stored policies
+     * @return true if the requested policies are active, false if not.
+     */
+    public boolean isActive(Policy policy) {
+        int reasons = getInactiveReasons(policy);
+        if (Email.DEBUG && (reasons != 0)) {
+            StringBuilder sb = new StringBuilder("isActive for " + policy + ": ");
+            if (reasons == 0) {
+                sb.append("true");
+            } else {
+                sb.append("FALSE -> ");
+            }
+            if ((reasons & INACTIVE_NEED_ACTIVATION) != 0) {
+                sb.append("no_admin ");
+            }
+            if ((reasons & INACTIVE_NEED_CONFIGURATION) != 0) {
+                sb.append("config ");
+            }
+            if ((reasons & INACTIVE_NEED_PASSWORD) != 0) {
+                sb.append("password ");
+            }
+            if ((reasons & INACTIVE_NEED_ENCRYPTION) != 0) {
+                sb.append("encryption ");
+            }
+            Log.d(TAG, sb.toString());
+        }
+        return reasons == 0;
+    }
+
+    /**
+     * Return bits from isActive:  Device Policy Manager has not been activated
+     */
+    public final static int INACTIVE_NEED_ACTIVATION = 1;
+
+    /**
+     * Return bits from isActive:  Some required configuration is not correct (no user action).
+     */
+    public final static int INACTIVE_NEED_CONFIGURATION = 2;
+
+    /**
+     * Return bits from isActive:  Password needs to be set or updated
+     */
+    public final static int INACTIVE_NEED_PASSWORD = 4;
+
+    /**
+     * Return bits from isActive:  Encryption has not be enabled
+     */
+    public final static int INACTIVE_NEED_ENCRYPTION = 8;
 
     /**
      * API: Query used to determine if a given policy is "active" (the device is operating at
@@ -208,48 +346,91 @@ public class SecurityPolicy {
      *
      * This method is for queries only, and does not trigger any change in device state.
      *
-     * @param policies the policies requested, or null to check aggregate stored policies
-     * @return true if the policies are active, false if not active
+     * NOTE:  If there are multiple accounts with password expiration policies, the device
+     * password will be set to expire in the shortest required interval (most secure).  This method
+     * will return 'false' as soon as the password expires - irrespective of which account caused
+     * the expiration.  In other words, all accounts (that require expiration) will run/stop
+     * based on the requirements of the account with the shortest interval.
+     *
+     * @param policy the policies requested, or null to check aggregate stored policies
+     * @return zero if the requested policies are active, non-zero bits indicates that more work
+     * is needed (typically, by the user) before the required security polices are fully active.
      */
-    public boolean isActive(PolicySet policies) {
+    public int getInactiveReasons(Policy policy) {
         // select aggregate set if needed
-        if (policies == null) {
-            policies = getAggregatePolicy();
+        if (policy == null) {
+            policy = getAggregatePolicy();
         }
         // quick check for the "empty set" of no policies
-        if (policies == NO_POLICY_SET) {
-            return true;
+        if (policy == Policy.NO_POLICY) {
+            return 0;
         }
+        int reasons = 0;
         DevicePolicyManager dpm = getDPM();
-        if (dpm.isAdminActive(mAdminName)) {
+        if (isActiveAdmin()) {
             // check each policy explicitly
-            if (policies.mMinPasswordLength > 0) {
-                if (dpm.getPasswordMinimumLength(mAdminName) < policies.mMinPasswordLength) {
-                    return false;
+            if (policy.mPasswordMinLength > 0) {
+                if (dpm.getPasswordMinimumLength(mAdminName) < policy.mPasswordMinLength) {
+                    reasons |= INACTIVE_NEED_PASSWORD;
                 }
             }
-            if (policies.mPasswordMode > 0) {
-                if (dpm.getPasswordQuality(mAdminName) < policies.getDPManagerPasswordQuality()) {
-                    return false;
+            if (policy.mPasswordMode > 0) {
+                if (dpm.getPasswordQuality(mAdminName) < policy.getDPManagerPasswordQuality()) {
+                    reasons |= INACTIVE_NEED_PASSWORD;
                 }
                 if (!dpm.isActivePasswordSufficient()) {
-                    return false;
+                    reasons |= INACTIVE_NEED_PASSWORD;
                 }
             }
-            if (policies.mMaxScreenLockTime > 0) {
+            if (policy.mMaxScreenLockTime > 0) {
                 // Note, we use seconds, dpm uses milliseconds
-                if (dpm.getMaximumTimeToLock(mAdminName) > policies.mMaxScreenLockTime * 1000) {
-                    return false;
+                if (dpm.getMaximumTimeToLock(mAdminName) > policy.mMaxScreenLockTime * 1000) {
+                    reasons |= INACTIVE_NEED_CONFIGURATION;
                 }
+            }
+            if (policy.mPasswordExpirationDays > 0) {
+                // confirm that expirations are currently set
+                long currentTimeout = dpm.getPasswordExpirationTimeout(mAdminName);
+                if (currentTimeout == 0
+                        || currentTimeout > policy.getDPManagerPasswordExpirationTimeout()) {
+                    reasons |= INACTIVE_NEED_PASSWORD;
+                }
+                // confirm that the current password hasn't expired
+                long expirationDate = dpm.getPasswordExpiration(mAdminName);
+                long timeUntilExpiration = expirationDate - System.currentTimeMillis();
+                boolean expired = timeUntilExpiration < 0;
+                if (expired) {
+                    reasons |= INACTIVE_NEED_PASSWORD;
+                }
+            }
+            if (policy.mPasswordHistory > 0) {
+                if (dpm.getPasswordHistoryLength(mAdminName) < policy.mPasswordHistory) {
+                    // There's no user action for changes here; this is just a configuration change
+                    reasons |= INACTIVE_NEED_CONFIGURATION;
+                }
+            }
+            if (policy.mPasswordComplexChars > 0) {
+                if (dpm.getPasswordMinimumNonLetter(mAdminName) < policy.mPasswordComplexChars) {
+                    reasons |= INACTIVE_NEED_PASSWORD;
+                }
+            }
+            if (policy.mRequireEncryption) {
+                int encryptionStatus = getDPM().getStorageEncryptionStatus();
+                if (encryptionStatus != DevicePolicyManager.ENCRYPTION_STATUS_ACTIVE) {
+                    reasons |= INACTIVE_NEED_ENCRYPTION;
+                }
+            }
+            if (policy.mDontAllowCamera && !dpm.getCameraDisabled(mAdminName)) {
+                reasons |= INACTIVE_NEED_CONFIGURATION;
             }
             // password failures are counted locally - no test required here
             // no check required for remote wipe (it's supported, if we're the admin)
 
-            // making it this far means we passed!
-            return true;
+            // If we made it all the way, reasons == 0 here.  Otherwise it's a list of grievances.
+            return reasons;
         }
         // return false, not active
-        return false;
+        return INACTIVE_NEED_ACTIVATION;
     }
 
     /**
@@ -260,19 +441,67 @@ public class SecurityPolicy {
     public void setActivePolicies() {
         DevicePolicyManager dpm = getDPM();
         // compute aggregate set of policies
-        PolicySet policies = getAggregatePolicy();
+        Policy aggregatePolicy = getAggregatePolicy();
         // if empty set, detach from policy manager
-        if (policies == NO_POLICY_SET) {
+        if (aggregatePolicy == Policy.NO_POLICY) {
+            if (Email.DEBUG) {
+                Log.d(TAG, "setActivePolicies: none, remove admin");
+            }
             dpm.removeActiveAdmin(mAdminName);
-        } else if (dpm.isAdminActive(mAdminName)) {
+        } else if (isActiveAdmin()) {
+            if (Email.DEBUG) {
+                Log.d(TAG, "setActivePolicies: " + aggregatePolicy);
+            }
             // set each policy in the policy manager
             // password mode & length
-            dpm.setPasswordQuality(mAdminName, policies.getDPManagerPasswordQuality());
-            dpm.setPasswordMinimumLength(mAdminName, policies.mMinPasswordLength);
+            dpm.setPasswordQuality(mAdminName, aggregatePolicy.getDPManagerPasswordQuality());
+            dpm.setPasswordMinimumLength(mAdminName, aggregatePolicy.mPasswordMinLength);
             // screen lock time
-            dpm.setMaximumTimeToLock(mAdminName, policies.mMaxScreenLockTime * 1000);
+            dpm.setMaximumTimeToLock(mAdminName, aggregatePolicy.mMaxScreenLockTime * 1000);
             // local wipe (failed passwords limit)
-            dpm.setMaximumFailedPasswordsForWipe(mAdminName, policies.mMaxPasswordFails);
+            dpm.setMaximumFailedPasswordsForWipe(mAdminName, aggregatePolicy.mPasswordMaxFails);
+            // password expiration (days until a password expires).  API takes mSec.
+            long oldExpiration = dpm.getPasswordExpirationTimeout(mAdminName);
+            long newExpiration = aggregatePolicy.getDPManagerPasswordExpirationTimeout();
+            // we only set this if it has changed; otherwise, we're pushing out the existing
+            // expiration time!
+            if (oldExpiration != newExpiration) {
+                dpm.setPasswordExpirationTimeout(mAdminName, newExpiration);
+            }
+            // password history length (number of previous passwords that may not be reused)
+            dpm.setPasswordHistoryLength(mAdminName, aggregatePolicy.mPasswordHistory);
+            // password minimum complex characters.
+            // Note, in Exchange, "complex chars" simply means "non alpha", but in the DPM,
+            // setting the quality to complex also defaults min symbols=1 and min numeric=1.
+            // We always / safely clear minSymbols & minNumeric to zero (there is no policy
+            // configuration in which we explicitly require a minimum number of digits or symbols.)
+            dpm.setPasswordMinimumSymbols(mAdminName, 0);
+            dpm.setPasswordMinimumNumeric(mAdminName, 0);
+            dpm.setPasswordMinimumNonLetter(mAdminName, aggregatePolicy.mPasswordComplexChars);
+            // Device capabilities
+            dpm.setCameraDisabled(mAdminName, aggregatePolicy.mDontAllowCamera);
+
+            // encryption required
+            dpm.setStorageEncryption(mAdminName, aggregatePolicy.mRequireEncryption);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+                // Disable/re-enable keyguard features as required
+                boolean noKeyguardFeatures =
+                        aggregatePolicy.mPasswordMode != Policy.PASSWORD_MODE_NONE;
+                dpm.setKeyguardDisabledFeatures(mAdminName,
+                        (noKeyguardFeatures ? DevicePolicyManager.KEYGUARD_DISABLE_FEATURES_ALL :
+                            DevicePolicyManager.KEYGUARD_DISABLE_FEATURES_NONE));
+            }
+
+        }
+    }
+
+    /**
+     * Convenience method; see javadoc below
+     */
+    public static void setAccountHoldFlag(Context context, long accountId, boolean newState) {
+        Account account = Account.restoreAccountWithId(context, accountId);
+        if (account != null) {
+            setAccountHoldFlag(context, account, newState);
         }
     }
 
@@ -280,8 +509,11 @@ public class SecurityPolicy {
      * API: Set/Clear the "hold" flag in any account.  This flag serves a dual purpose:
      * Setting it gives us an indication that it was blocked, and clearing it gives EAS a
      * signal to try syncing again.
+     * @param context
+     * @param account the account whose hold flag is to be set/cleared
+     * @param newState true = security hold, false = free to sync
      */
-    public void setAccountHoldFlag(Account account, boolean newState) {
+    public static void setAccountHoldFlag(Context context, Account account, boolean newState) {
         if (newState) {
             account.mFlags |= Account.FLAGS_SECURITY_HOLD;
         } else {
@@ -289,31 +521,101 @@ public class SecurityPolicy {
         }
         ContentValues cv = new ContentValues();
         cv.put(AccountColumns.FLAGS, account.mFlags);
-        account.update(mContext, cv);
+        account.update(context, cv);
+    }
+
+    public static void clearAccountPolicy(Context context, Account account) {
+        setAccountPolicy(context, account, null, null);
     }
 
     /**
-     * Clear all account hold flags that are set.  This will trigger watchers, and in particular
-     * will cause EAS to try and resync the account(s).
+     * Set the policy for an account atomically; this also removes any other policy associated with
+     * the account and sets the policy key for the account.  If policy is null, the policyKey is
+     * set to 0 and the securitySyncKey to null.  Also, update the account object to reflect the
+     * current policyKey and securitySyncKey
+     * @param context the caller's context
+     * @param account the account whose policy is to be set
+     * @param policy the policy to set, or null if we're clearing the policy
+     * @param securitySyncKey the security sync key for this account (ignored if policy is null)
      */
-    public void clearAccountHoldFlags() {
-        ContentResolver resolver = mContext.getContentResolver();
-        Cursor c = resolver.query(Account.CONTENT_URI, ACCOUNT_FLAGS_PROJECTION,
-                WHERE_ACCOUNT_SECURITY_NONZERO, null, null);
-        try {
-            while (c.moveToNext()) {
-                int flags = c.getInt(ACCOUNT_FLAGS_COLUMN_FLAGS);
-                if (0 != (flags & Account.FLAGS_SECURITY_HOLD)) {
-                    ContentValues cv = new ContentValues();
-                    cv.put(AccountColumns.FLAGS, flags & ~Account.FLAGS_SECURITY_HOLD);
-                    long accountId = c.getLong(ACCOUNT_FLAGS_COLUMN_ID);
-                    Uri uri = ContentUris.withAppendedId(Account.CONTENT_URI, accountId);
-                    resolver.update(uri, cv, null, null);
-                }
-            }
-        } finally {
-            c.close();
+    public static void setAccountPolicy(Context context, Account account, Policy policy,
+            String securitySyncKey) {
+        ArrayList<ContentProviderOperation> ops = new ArrayList<ContentProviderOperation>();
+
+        // Make sure this is a valid policy set
+        if (policy != null) {
+            policy.normalize();
+            // Add the new policy (no account will yet reference this)
+            ops.add(ContentProviderOperation.newInsert(
+                    Policy.CONTENT_URI).withValues(policy.toContentValues()).build());
+            // Make the policyKey of the account our newly created policy, and set the sync key
+            ops.add(ContentProviderOperation.newUpdate(
+                    ContentUris.withAppendedId(Account.CONTENT_URI, account.mId))
+                    .withValueBackReference(AccountColumns.POLICY_KEY, 0)
+                    .withValue(AccountColumns.SECURITY_SYNC_KEY, securitySyncKey)
+                    .build());
+        } else {
+            ops.add(ContentProviderOperation.newUpdate(
+                    ContentUris.withAppendedId(Account.CONTENT_URI, account.mId))
+                    .withValue(AccountColumns.SECURITY_SYNC_KEY, null)
+                    .withValue(AccountColumns.POLICY_KEY, 0)
+                    .build());
         }
+
+        // Delete the previous policy associated with this account, if any
+        if (account.mPolicyKey > 0) {
+            ops.add(ContentProviderOperation.newDelete(
+                    ContentUris.withAppendedId(
+                            Policy.CONTENT_URI, account.mPolicyKey)).build());
+        }
+
+        try {
+            context.getContentResolver().applyBatch(EmailContent.AUTHORITY, ops);
+            account.refresh(context);
+        } catch (RemoteException e) {
+            // This is fatal to a remote process
+            throw new IllegalStateException("Exception setting account policy.");
+        } catch (OperationApplicationException e) {
+            // Can't happen; our provider doesn't throw this exception
+        }
+    }
+
+    /**
+     * API: Report that policies may have been updated due to rewriting values in an Account; we
+     * clear the aggregate policy (so it can be recomputed) and set the policies in the DPM
+     */
+    public synchronized void policiesUpdated() {
+        mAggregatePolicy = null;
+        setActivePolicies();
+    }
+
+    public void setAccountPolicy(long accountId, Policy policy, String securityKey) {
+        Account account = Account.restoreAccountWithId(mContext, accountId);
+        Policy oldPolicy = null;
+        if (account.mPolicyKey > 0) {
+            oldPolicy = Policy.restorePolicyWithId(mContext, account.mPolicyKey);
+        }
+        boolean policyChanged = (oldPolicy == null) || !oldPolicy.equals(policy);
+        if (!policyChanged && (TextUtilities.stringOrNullEquals(securityKey,
+                account.mSecuritySyncKey))) {
+            Log.d(Logging.LOG_TAG, "setAccountPolicy; policy unchanged");
+        } else {
+            setAccountPolicy(mContext, account, policy, securityKey);
+            policiesUpdated();
+        }
+
+        boolean setHold = false;
+        if (isActive(policy)) {
+            // For Email1, ignore; it's really just a courtesy notification
+        } else {
+            setHold = true;
+            Log.d(Logging.LOG_TAG, "Notify policies for " + account.mDisplayName +
+                    " are not being enforced.");
+            // Put up a notification
+            NotificationController.getInstance(mContext).showSecurityNeededNotification(account);
+        }
+        // Set/clear the account hold.
+        setAccountHoldFlag(mContext, account, setHold);
     }
 
     /**
@@ -325,278 +627,66 @@ public class SecurityPolicy {
      * @param accountId the account for which sync cannot proceed
      */
     public void policiesRequired(long accountId) {
-        Account account = EmailContent.Account.restoreAccountWithId(mContext, accountId);
+        Account account = Account.restoreAccountWithId(mContext, accountId);
+        // In case the account has been deleted, just return
+        if (account == null) return;
+        if (Email.DEBUG) {
+            if (account.mPolicyKey == 0) {
+                Log.d(TAG, "policiesRequired for " + account.mDisplayName + ": none");
+            } else {
+                Policy policy = Policy.restorePolicyWithId(mContext, account.mPolicyKey);
+                if (policy == null) {
+                    Log.w(TAG, "No policy??");
+                } else {
+                    Log.d(TAG, "policiesRequired for " + account.mDisplayName + ": " + policy);
+                }
+            }
+        }
 
         // Mark the account as "on hold".
-        setAccountHoldFlag(account, true);
+        setAccountHoldFlag(mContext, account, true);
 
         // Put up a notification
-        String tickerText = mContext.getString(R.string.security_notification_ticker_fmt,
-                account.getDisplayName());
-        String contentTitle = mContext.getString(R.string.security_notification_content_title);
-        String contentText = account.getDisplayName();
-        String ringtoneString = account.getRingtone();
-        Uri ringTone = (ringtoneString == null) ? null : Uri.parse(ringtoneString);
-        boolean vibrate = 0 != (account.mFlags & Account.FLAGS_VIBRATE_ALWAYS);
-        boolean vibrateWhenSilent = 0 != (account.mFlags & Account.FLAGS_VIBRATE_WHEN_SILENT);
-
-        Intent intent = AccountSecurity.actionUpdateSecurityIntent(mContext, accountId);
-        PendingIntent pending =
-            PendingIntent.getActivity(mContext, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
-
-        Notification notification = new Notification(R.drawable.stat_notify_email_generic,
-                tickerText, System.currentTimeMillis());
-        notification.setLatestEventInfo(mContext, contentTitle, contentText, pending);
-
-        // Use the account's notification rules for sound & vibrate (but always notify)
-        AudioManager audioManager =
-            (AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE);
-        boolean nowSilent =
-            audioManager.getRingerMode() == AudioManager.RINGER_MODE_VIBRATE;
-        notification.sound = ringTone;
-
-        if (vibrate || (vibrateWhenSilent && nowSilent)) {
-            notification.defaults |= Notification.DEFAULT_VIBRATE;
-        }
-        notification.flags |= Notification.FLAG_SHOW_LIGHTS;
-        notification.defaults |= Notification.DEFAULT_LIGHTS;
-
-        NotificationManager notificationManager =
-            (NotificationManager) mContext.getSystemService(Context.NOTIFICATION_SERVICE);
-        notificationManager.notify(MailService.NOTIFICATION_ID_SECURITY_NEEDED, notification);
+        NotificationController.getInstance(mContext).showSecurityNeededNotification(account);
     }
 
     /**
      * Called from the notification's intent receiver to register that the notification can be
      * cleared now.
      */
-    public void clearNotification(long accountId) {
-        NotificationManager notificationManager =
-            (NotificationManager) mContext.getSystemService(Context.NOTIFICATION_SERVICE);
-        notificationManager.cancel(MailService.NOTIFICATION_ID_SECURITY_NEEDED);
+    public void clearNotification() {
+        NotificationController.getInstance(mContext).cancelSecurityNeededNotification();
     }
 
     /**
      * API: Remote wipe (from server).  This is final, there is no confirmation.  It will only
-     * return to the caller if there is an unexpected failure.
+     * return to the caller if there is an unexpected failure.  The wipe includes external storage.
      */
     public void remoteWipe() {
         DevicePolicyManager dpm = getDPM();
         if (dpm.isAdminActive(mAdminName)) {
-            dpm.wipeData(0);
+            dpm.wipeData(DevicePolicyManager.WIPE_EXTERNAL_STORAGE);
         } else {
-            Log.d(Email.LOG_TAG, "Could not remote wipe because not device admin.");
+            Log.d(Logging.LOG_TAG, "Could not remote wipe because not device admin.");
         }
     }
-
-    /**
-     * Class for tracking policies and reading/writing into accounts
-     */
-    public static class PolicySet {
-
-        // Security (provisioning) flags
-            // bits 0..4: password length (0=no password required)
-        private static final int PASSWORD_LENGTH_MASK = 31;
-        private static final int PASSWORD_LENGTH_SHIFT = 0;
-        public static final int PASSWORD_LENGTH_MAX = 30;
-            // bits 5..8: password mode
-        private static final int PASSWORD_MODE_SHIFT = 5;
-        private static final int PASSWORD_MODE_MASK = 15 << PASSWORD_MODE_SHIFT;
-        public static final int PASSWORD_MODE_NONE = 0 << PASSWORD_MODE_SHIFT;
-        public static final int PASSWORD_MODE_SIMPLE = 1 << PASSWORD_MODE_SHIFT;
-        public static final int PASSWORD_MODE_STRONG = 2 << PASSWORD_MODE_SHIFT;
-            // bits 9..13: password failures -> wipe device (0=disabled)
-        private static final int PASSWORD_MAX_FAILS_SHIFT = 9;
-        private static final int PASSWORD_MAX_FAILS_MASK = 31 << PASSWORD_MAX_FAILS_SHIFT;
-        public static final int PASSWORD_MAX_FAILS_MAX = 31;
-            // bits 14..24: seconds to screen lock (0=not required)
-        private static final int SCREEN_LOCK_TIME_SHIFT = 14;
-        private static final int SCREEN_LOCK_TIME_MASK = 2047 << SCREEN_LOCK_TIME_SHIFT;
-        public static final int SCREEN_LOCK_TIME_MAX = 2047;
-            // bit 25: remote wipe capability required
-        private static final int REQUIRE_REMOTE_WIPE = 1 << 25;
-
-        /*package*/ final int mMinPasswordLength;
-        /*package*/ final int mPasswordMode;
-        /*package*/ final int mMaxPasswordFails;
-        /*package*/ final int mMaxScreenLockTime;
-        /*package*/ final boolean mRequireRemoteWipe;
-
-        public int getMinPasswordLengthForTest() {
-            return mMinPasswordLength;
-        }
-
-        public int getPasswordModeForTest() {
-            return mPasswordMode;
-        }
-
-        public int getMaxPasswordFailsForTest() {
-            return mMaxPasswordFails;
-        }
-
-        public int getMaxScreenLockTimeForTest() {
-            return mMaxScreenLockTime;
-        }
-
-        public boolean isRequireRemoteWipeForTest() {
-            return mRequireRemoteWipe;
-        }
-
-        /**
-         * Create from raw values.
-         * @param minPasswordLength (0=not enforced)
-         * @param passwordMode
-         * @param maxPasswordFails (0=not enforced)
-         * @param maxScreenLockTime in seconds (0=not enforced)
-         * @param requireRemoteWipe
-         * @throws IllegalArgumentException for illegal arguments.
-         */
-        public PolicySet(int minPasswordLength, int passwordMode, int maxPasswordFails,
-                int maxScreenLockTime, boolean requireRemoteWipe) throws IllegalArgumentException {
-            // If we're not enforcing passwords, make sure we clean up related values, since EAS
-            // can send non-zero values for any or all of these
-            if (passwordMode == PASSWORD_MODE_NONE) {
-                maxPasswordFails = 0;
-                maxScreenLockTime = 0;
-                minPasswordLength = 0;
-            } else {
-                if ((passwordMode != PASSWORD_MODE_SIMPLE) &&
-                        (passwordMode != PASSWORD_MODE_STRONG)) {
-                    throw new IllegalArgumentException("password mode");
-                }
-                // The next value has a hard limit which cannot be supported if exceeded.
-                if (minPasswordLength > PASSWORD_LENGTH_MAX) {
-                    throw new IllegalArgumentException("password length");
-                }
-                // This value can be reduced (which actually increases security) if necessary
-                if (maxPasswordFails > PASSWORD_MAX_FAILS_MAX) {
-                    maxPasswordFails = PASSWORD_MAX_FAILS_MAX;
-                }
-                // This value can be reduced (which actually increases security) if necessary
-                if (maxScreenLockTime > SCREEN_LOCK_TIME_MAX) {
-                    maxScreenLockTime = SCREEN_LOCK_TIME_MAX;
-                }
-            }
-            mMinPasswordLength = minPasswordLength;
-            mPasswordMode = passwordMode;
-            mMaxPasswordFails = maxPasswordFails;
-            mMaxScreenLockTime = maxScreenLockTime;
-            mRequireRemoteWipe = requireRemoteWipe;
-        }
-
-        /**
-         * Create from values encoded in an account
-         * @param account
-         */
-        public PolicySet(Account account) {
-            this(account.mSecurityFlags);
-        }
-
-        /**
-         * Create from values encoded in an account flags int
-         */
-        public PolicySet(int flags) {
-            mMinPasswordLength =
-                (flags & PASSWORD_LENGTH_MASK) >> PASSWORD_LENGTH_SHIFT;
-            mPasswordMode =
-                (flags & PASSWORD_MODE_MASK);
-            mMaxPasswordFails =
-                (flags & PASSWORD_MAX_FAILS_MASK) >> PASSWORD_MAX_FAILS_SHIFT;
-            mMaxScreenLockTime =
-                (flags & SCREEN_LOCK_TIME_MASK) >> SCREEN_LOCK_TIME_SHIFT;
-            mRequireRemoteWipe = 0 != (flags & REQUIRE_REMOTE_WIPE);
-        }
-
-        /**
-         * Helper to map our internal encoding to DevicePolicyManager password modes.
-         */
-        public int getDPManagerPasswordQuality() {
-            switch (mPasswordMode) {
-                case PASSWORD_MODE_SIMPLE:
-                    return DevicePolicyManager.PASSWORD_QUALITY_NUMERIC;
-                case PASSWORD_MODE_STRONG:
-                    return DevicePolicyManager.PASSWORD_QUALITY_ALPHANUMERIC;
-                default:
-                    return DevicePolicyManager .PASSWORD_QUALITY_UNSPECIFIED;
-            }
-        }
-
-        /**
-         * Record flags (and a sync key for the flags) into an Account
-         * Note: the hash code is defined as the encoding used in Account
-         *
-         * @param account to write the values mSecurityFlags and mSecuritySyncKey
-         * @param syncKey the value to write into the account's mSecuritySyncKey
-         * @param update if true, also writes the account back to the provider (updating only
-         *  the fields changed by this API)
-         * @param context a context for writing to the provider
-         * @return true if the actual policies changed, false if no change (note, sync key
-         *  does not affect this)
-         */
-        public boolean writeAccount(Account account, String syncKey, boolean update,
-                Context context) {
-            int newFlags = hashCode();
-            boolean dirty = (newFlags != account.mSecurityFlags);
-            account.mSecurityFlags = newFlags;
-            account.mSecuritySyncKey = syncKey;
-            if (update) {
-                if (account.isSaved()) {
-                    ContentValues cv = new ContentValues();
-                    cv.put(AccountColumns.SECURITY_FLAGS, account.mSecurityFlags);
-                    cv.put(AccountColumns.SECURITY_SYNC_KEY, account.mSecuritySyncKey);
-                    account.update(context, cv);
-                } else {
-                    account.save(context);
-                }
-            }
-            return dirty;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (o instanceof PolicySet) {
-                PolicySet other = (PolicySet)o;
-                return (this.mMinPasswordLength == other.mMinPasswordLength)
-                        && (this.mPasswordMode == other.mPasswordMode)
-                        && (this.mMaxPasswordFails == other.mMaxPasswordFails)
-                        && (this.mMaxScreenLockTime == other.mMaxScreenLockTime)
-                        && (this.mRequireRemoteWipe == other.mRequireRemoteWipe);
-            }
-            return false;
-        }
-
-        /**
-         * Note: the hash code is defined as the encoding used in Account
-         */
-        @Override
-        public int hashCode() {
-            int flags = 0;
-            flags = mMinPasswordLength << PASSWORD_LENGTH_SHIFT;
-            flags |= mPasswordMode;
-            flags |= mMaxPasswordFails << PASSWORD_MAX_FAILS_SHIFT;
-            flags |= mMaxScreenLockTime << SCREEN_LOCK_TIME_SHIFT;
-            if (mRequireRemoteWipe) {
-                flags |= REQUIRE_REMOTE_WIPE;
-            }
-            return flags;
-        }
-
-        @Override
-        public String toString() {
-            return "{ " + "pw-len-min=" + mMinPasswordLength + " pw-mode=" + mPasswordMode
-                    + " pw-fails-max=" + mMaxPasswordFails + " screenlock-max="
-                    + mMaxScreenLockTime + " remote-wipe-req=" + mRequireRemoteWipe + "}";
-        }
-    }
-
     /**
      * If we are not the active device admin, try to become so.
+     *
+     * Also checks for any policies that we have added during the lifetime of this app.
+     * This catches the case where the user granted an earlier (smaller) set of policies
+     * but an app upgrade requires that new policies be granted.
      *
      * @return true if we are already active, false if we are not
      */
     public boolean isActiveAdmin() {
         DevicePolicyManager dpm = getDPM();
-        return dpm.isAdminActive(mAdminName);
+        return dpm.isAdminActive(mAdminName)
+                && dpm.hasGrantedPolicy(mAdminName, DeviceAdminInfo.USES_POLICY_EXPIRE_PASSWORD)
+                && dpm.hasGrantedPolicy(mAdminName, DeviceAdminInfo.USES_ENCRYPTED_STORAGE)
+                && dpm.hasGrantedPolicy(mAdminName, DeviceAdminInfo.USES_POLICY_DISABLE_CAMERA)
+                && dpm.hasGrantedPolicy(mAdminName,
+                        DeviceAdminInfo.USES_POLICY_DISABLE_KEYGUARD_FEATURES);
     }
 
     /**
@@ -607,25 +697,157 @@ public class SecurityPolicy {
     }
 
     /**
-     * Internal handler for enabled->disabled transitions.  Resets all security keys
-     * forcing EAS to resync security state.
+     * Delete all accounts whose security flags aren't zero (i.e. they have security enabled).
+     * This method is synchronous, so it should normally be called within a worker thread (the
+     * exception being for unit tests)
+     *
+     * @param context the caller's context
      */
-    /* package */ void onAdminEnabled(boolean isEnabled) {
+    /*package*/ void deleteSecuredAccounts(Context context) {
+        ContentResolver cr = context.getContentResolver();
+        // Find all accounts with security and delete them
+        Cursor c = cr.query(Account.CONTENT_URI, EmailContent.ID_PROJECTION,
+                Account.SECURITY_NONZERO_SELECTION, null, null);
+        try {
+            Log.w(TAG, "Email administration disabled; deleting " + c.getCount() +
+                    " secured account(s)");
+            while (c.moveToNext()) {
+                Controller.getInstance(context).deleteAccountSync(
+                        c.getLong(EmailContent.ID_PROJECTION_COLUMN), context);
+            }
+        } finally {
+            c.close();
+        }
+        policiesUpdated(-1);
+    }
+
+    /**
+     * Internal handler for enabled->disabled transitions.  Deletes all secured accounts.
+     * Must call from worker thread, not on UI thread.
+     */
+    /*package*/ void onAdminEnabled(boolean isEnabled) {
         if (!isEnabled) {
-            // transition to disabled state
-            // Response:  clear *all* security state information from the accounts, forcing
-            // them back to the initial configurations requiring policy administration
-            ContentValues cv = new ContentValues();
-            cv.put(AccountColumns.SECURITY_FLAGS, 0);
-            cv.putNull(AccountColumns.SECURITY_SYNC_KEY);
-            mContext.getContentResolver().update(Account.CONTENT_URI, cv, null, null);
-            updatePolicies(-1);
+            deleteSecuredAccounts(mContext);
+        }
+    }
+
+    /**
+     * Handle password expiration - if any accounts appear to have triggered this, put up
+     * warnings, or even shut them down.
+     *
+     * NOTE:  If there are multiple accounts with password expiration policies, the device
+     * password will be set to expire in the shortest required interval (most secure).  The logic
+     * in this method operates based on the aggregate setting - irrespective of which account caused
+     * the expiration.  In other words, all accounts (that require expiration) will run/stop
+     * based on the requirements of the account with the shortest interval.
+     */
+    private void onPasswordExpiring(Context context) {
+        // 1.  Do we have any accounts that matter here?
+        long nextExpiringAccountId = findShortestExpiration(context);
+
+        // 2.  If not, exit immediately
+        if (nextExpiringAccountId == -1) {
+            return;
+        }
+
+        // 3.  If yes, are we warning or expired?
+        long expirationDate = getDPM().getPasswordExpiration(mAdminName);
+        long timeUntilExpiration = expirationDate - System.currentTimeMillis();
+        boolean expired = timeUntilExpiration < 0;
+        if (!expired) {
+            // 4.  If warning, simply put up a generic notification and report that it came from
+            // the shortest-expiring account.
+            NotificationController.getInstance(mContext).showPasswordExpiringNotification(
+                    nextExpiringAccountId);
+        } else {
+            // 5.  Actually expired - find all accounts that expire passwords, and wipe them
+            boolean wiped = wipeExpiredAccounts(context, Controller.getInstance(context));
+            if (wiped) {
+                NotificationController.getInstance(mContext).showPasswordExpiredNotification(
+                        nextExpiringAccountId);
+            }
+        }
+    }
+
+    /**
+     * Find the account with the shortest expiration time.  This is always assumed to be
+     * the account that forces the password to be refreshed.
+     * @return -1 if no expirations, or accountId if one is found
+     */
+    @VisibleForTesting
+    /*package*/ static long findShortestExpiration(Context context) {
+        long policyId = Utility.getFirstRowLong(context, Policy.CONTENT_URI, Policy.ID_PROJECTION,
+                HAS_PASSWORD_EXPIRATION, null, PolicyColumns.PASSWORD_EXPIRATION_DAYS + " ASC",
+                EmailContent.ID_PROJECTION_COLUMN, -1L);
+        if (policyId < 0) return -1L;
+        return Policy.getAccountIdWithPolicyKey(context, policyId);
+    }
+
+    /**
+     * For all accounts that require password expiration, put them in security hold and wipe
+     * their data.
+     * @param context
+     * @param controller
+     * @return true if one or more accounts were wiped
+     */
+    @VisibleForTesting
+    /*package*/ static boolean wipeExpiredAccounts(Context context, Controller controller) {
+        boolean result = false;
+        Cursor c = context.getContentResolver().query(Policy.CONTENT_URI,
+                Policy.ID_PROJECTION, HAS_PASSWORD_EXPIRATION, null, null);
+        try {
+            while (c.moveToNext()) {
+                long policyId = c.getLong(Policy.ID_PROJECTION_COLUMN);
+                long accountId = Policy.getAccountIdWithPolicyKey(context, policyId);
+                if (accountId < 0) continue;
+                Account account = Account.restoreAccountWithId(context, accountId);
+                if (account != null) {
+                    // Mark the account as "on hold".
+                    setAccountHoldFlag(context, account, true);
+                    // Erase data
+                    controller.deleteSyncedDataSync(accountId);
+                    // Report one or more were found
+                    result = true;
+                }
+            }
+        } finally {
+            c.close();
+        }
+        return result;
+    }
+
+    /**
+     * Callback from EmailBroadcastProcessorService.  This provides the workers for the
+     * DeviceAdminReceiver calls.  These should perform the work directly and not use async
+     * threads for completion.
+     */
+    public static void onDeviceAdminReceiverMessage(Context context, int message) {
+        SecurityPolicy instance = SecurityPolicy.getInstance(context);
+        switch (message) {
+            case DEVICE_ADMIN_MESSAGE_ENABLED:
+                instance.onAdminEnabled(true);
+                break;
+            case DEVICE_ADMIN_MESSAGE_DISABLED:
+                instance.onAdminEnabled(false);
+                break;
+            case DEVICE_ADMIN_MESSAGE_PASSWORD_CHANGED:
+                // TODO make a small helper for this
+                // Clear security holds (if any)
+                Account.clearSecurityHoldOnAllAccounts(context);
+                // Cancel any active notifications (if any are posted)
+                NotificationController.getInstance(context).cancelPasswordExpirationNotifications();
+                break;
+            case DEVICE_ADMIN_MESSAGE_PASSWORD_EXPIRING:
+                instance.onPasswordExpiring(instance.mContext);
+                break;
         }
     }
 
     /**
      * Device Policy administrator.  This is primarily a listener for device state changes.
      * Note:  This is instantiated by incoming messages.
+     * Note:  This is actually a BroadcastReceiver and must remain within the guidelines required
+     *        for proper behavior, including avoidance of ANRs.
      * Note:  We do not implement onPasswordFailed() because the default behavior of the
      *        DevicePolicyManager - complete local wipe after 'n' failures - is sufficient.
      */
@@ -636,7 +858,8 @@ public class SecurityPolicy {
          */
         @Override
         public void onEnabled(Context context, Intent intent) {
-            SecurityPolicy.getInstance(context).onAdminEnabled(true);
+            EmailBroadcastProcessorService.processDevicePolicyMessage(context,
+                    DEVICE_ADMIN_MESSAGE_ENABLED);
         }
 
         /**
@@ -644,7 +867,17 @@ public class SecurityPolicy {
          */
         @Override
         public void onDisabled(Context context, Intent intent) {
-            SecurityPolicy.getInstance(context).onAdminEnabled(false);
+            EmailBroadcastProcessorService.processDevicePolicyMessage(context,
+                    DEVICE_ADMIN_MESSAGE_DISABLED);
+        }
+
+        /**
+         * Called when the user asks to disable administration; we return a warning string that
+         * will be presented to the user
+         */
+        @Override
+        public CharSequence onDisableRequested(Context context, Intent intent) {
+            return context.getString(R.string.disable_admin_warning);
         }
 
         /**
@@ -652,7 +885,17 @@ public class SecurityPolicy {
          */
         @Override
         public void onPasswordChanged(Context context, Intent intent) {
-            SecurityPolicy.getInstance(context).clearAccountHoldFlags();
+            EmailBroadcastProcessorService.processDevicePolicyMessage(context,
+                    DEVICE_ADMIN_MESSAGE_PASSWORD_CHANGED);
+        }
+
+        /**
+         * Called when device password is expiring
+         */
+        @Override
+        public void onPasswordExpiring(Context context, Intent intent) {
+            EmailBroadcastProcessorService.processDevicePolicyMessage(context,
+                    DEVICE_ADMIN_MESSAGE_PASSWORD_EXPIRING);
         }
     }
 }

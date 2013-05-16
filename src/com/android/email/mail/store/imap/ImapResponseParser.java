@@ -19,12 +19,12 @@ package com.android.email.mail.store.imap;
 import com.android.email.Email;
 import com.android.email.FixedLengthInputStream;
 import com.android.email.PeekableInputStream;
-import com.android.email.mail.MessagingException;
 import com.android.email.mail.transport.DiscourseLogger;
-import com.android.email.mail.transport.LoggingInputStream;
+import com.android.emailcommon.Logging;
+import com.android.emailcommon.mail.MessagingException;
+import com.android.emailcommon.utility.LoggingInputStream;
 
 import android.text.TextUtils;
-import android.util.Config;
 import android.util.Log;
 
 import java.io.IOException;
@@ -40,7 +40,7 @@ public class ImapResponseParser {
     /**
      * Literal larger than this will be stored in temp file.
      */
-    private static final int LITERAL_KEEP_IN_MEMORY_THRESHOLD = 16 * 1024 * 1024;
+    private static final int LITERAL_KEEP_IN_MEMORY_THRESHOLD = 2 * 1024 * 1024;
 
     /** Input stream */
     private final PeekableInputStream mIn;
@@ -89,7 +89,7 @@ public class ImapResponseParser {
      */
     /* package for test */ ImapResponseParser(InputStream in, DiscourseLogger discourseLogger,
             int literalKeepInMemoryThreshold) {
-        if (DEBUG_LOG_RAW_STREAM && Config.LOGD && Email.DEBUG) {
+        if (DEBUG_LOG_RAW_STREAM && Email.DEBUG) {
             in = new LoggingInputStream(in);
         }
         mIn = new PeekableInputStream(in);
@@ -99,8 +99,8 @@ public class ImapResponseParser {
 
     private static IOException newEOSException() {
         final String message = "End of stream reached";
-        if (Config.LOGD && Email.DEBUG) {
-            Log.d(Email.LOG_TAG, message);
+        if (Email.DEBUG) {
+            Log.d(Logging.LOG_TAG, message);
         }
         return new IOException(message);
     }
@@ -161,8 +161,8 @@ public class ImapResponseParser {
         ImapResponse response = null;
         try {
             response = parseResponse();
-            if (Config.LOGD && Email.DEBUG) {
-                Log.d(Email.LOG_TAG, "<<< " + response.toString());
+            if (Email.DEBUG) {
+                Log.d(Logging.LOG_TAG, "<<< " + response.toString());
             }
 
         } catch (RuntimeException e) {
@@ -177,7 +177,7 @@ public class ImapResponseParser {
 
         // Handle this outside of try-catch.  We don't have to dump protocol log when getting BYE.
         if (response.is(0, ImapConstants.BYE)) {
-            Log.w(Email.LOG_TAG, ByeException.MESSAGE);
+            Log.w(Logging.LOG_TAG, ByeException.MESSAGE);
             response.destroy();
             throw new ByeException();
         }
@@ -201,7 +201,7 @@ public class ImapResponseParser {
             }
         } catch (IOException ignore) {
         }
-        Log.w(Email.LOG_TAG, "Exception detected: " + e.getMessage());
+        Log.w(Logging.LOG_TAG, "Exception detected: " + e.getMessage());
         mDiscourseLogger.logLastDiscourse();
     }
 
@@ -236,7 +236,7 @@ public class ImapResponseParser {
     /**
      * Read all bytes until \r\n.
      */
-    /* package */ String readUntilEol() throws IOException, MessagingException {
+    /* package */ String readUntilEol() throws IOException {
         String ret = readUntil('\r');
         expect('\n'); // TODO Should this really be error?
         return ret;

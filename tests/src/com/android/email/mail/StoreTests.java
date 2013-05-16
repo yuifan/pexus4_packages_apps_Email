@@ -16,93 +16,108 @@
 
 package com.android.email.mail;
 
-import com.android.email.Email;
-
-import android.test.AndroidTestCase;
+import android.content.Context;
+import android.test.ProviderTestCase2;
 import android.test.suitebuilder.annotation.MediumTest;
+
+import com.android.email.provider.EmailProvider;
+import com.android.email.provider.ProviderTestUtils;
+import com.android.emailcommon.mail.MessagingException;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.EmailContent;
+import com.android.emailcommon.provider.HostAuth;
+import com.android.emailcommon.provider.Mailbox;
 
 /**
  * Tests of StoreInfo & Store lookup in the Store abstract class
+ *
+ * You can run this entire test case with:
+ *   runtest -c com.android.email.mail.store.StoreTests email
+ *
  */
+
 @MediumTest
-public class StoreTests extends AndroidTestCase {
+public class StoreTests extends ProviderTestCase2<EmailProvider> {
 
-    /**
-     * Test StoreInfo & Store lookup for POP accounts
-     */
-    public void testStoreLookupPOP() throws MessagingException {
-        final String storeUri = "pop3://user:password@server.com";
-        Store.StoreInfo info = Store.StoreInfo.getStoreInfo(storeUri, getContext());
-        
-        assertNotNull("storeInfo null", info);
-        assertNotNull("scheme null", info.mScheme);
-        assertNotNull("classname null", info.mClassName);
-        assertFalse(info.mPushSupported);
-        assertEquals(Email.VISIBLE_LIMIT_DEFAULT, info.mVisibleLimitDefault);
-        assertEquals(Email.VISIBLE_LIMIT_INCREMENT, info.mVisibleLimitIncrement);
-        
-        // This will throw MessagingException if the result would have been null
-        Store store = Store.getInstance(storeUri, getContext(), null);
-    }
-        
-    /**
-     * Test StoreInfo & Store lookup for IMAP accounts
-     */
-    public void testStoreLookupIMAP() throws MessagingException {
-        final String storeUri = "imap://user:password@server.com";
-        Store.StoreInfo info = Store.StoreInfo.getStoreInfo(storeUri, getContext());
-        
-        assertNotNull("storeInfo null", info);
-        assertNotNull("scheme null", info.mScheme);
-        assertNotNull("classname null", info.mClassName);
-        assertFalse(info.mPushSupported);
-        assertEquals(Email.VISIBLE_LIMIT_DEFAULT, info.mVisibleLimitDefault);
-        assertEquals(Email.VISIBLE_LIMIT_INCREMENT, info.mVisibleLimitIncrement);
-        
-        // This will throw MessagingException if the result would have been null
-        Store store = Store.getInstance(storeUri, getContext(), null);
-    }
-        
-    /**
-     * Test StoreInfo & Store lookup for EAS accounts
-     * TODO: EAS store will probably require implementation of Store.PersistentDataCallbacks
-     */
-    public void testStoreLookupEAS() throws MessagingException {
-        final String storeUri = "eas://user:password@server.com";
-        Store.StoreInfo info = Store.StoreInfo.getStoreInfo(storeUri, getContext());
-        if (info != null) {
-            assertNotNull("scheme null", info.mScheme);
-            assertNotNull("classname null", info.mClassName);
-            assertTrue(info.mPushSupported);
-            assertEquals(-1, info.mVisibleLimitDefault);
-            assertEquals(-1, info.mVisibleLimitIncrement);
-            
-            // This will throw MessagingException if the result would have been null
-            Store store = Store.getInstance(storeUri, getContext(), null);
-        } else {
-            try {
-                Store store = Store.getInstance(storeUri, getContext(), null);
-                fail("MessagingException expected when EAS not supported");
-            } catch (MessagingException me) {
-                // expected - fall through
-            }
-        }
-    }
-    
-    /**
-     * Test StoreInfo & Store lookup for unknown accounts
-     */
-    public void testStoreLookupUnknown() {
-        final String storeUri = "bogus-scheme://user:password@server.com";
-        Store.StoreInfo info = Store.StoreInfo.getStoreInfo(storeUri, getContext());
-        assertNull(info);
+    private Context mMockContext;
 
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
+        mMockContext = getMockContext();
+        Store.sStores.clear();
+    }
+
+    public StoreTests(Class<EmailProvider> providerClass, String providerAuthority) {
+        super(EmailProvider.class, EmailContent.AUTHORITY);
+    }
+
+    public void testGetInstance() throws MessagingException {
+        Store testStore;
+
+        // POP3
+        Account testAccount = ProviderTestUtils.setupAccount("pop", false, mMockContext);
+        HostAuth testAuth = new HostAuth();
+        testAccount.mHostAuthRecv = testAuth;
+        testAuth.mAddress = "pop3.google.com";
+        testAuth.mProtocol = "pop3";
+        testAccount.save(mMockContext);
+
+        testStore = Store.getInstance(testAccount, getContext());
+        assertEquals(1, Store.sStores.size());
+        assertSame(testStore, Store.sStores.get(testAccount.mId));
+        Store.sStores.clear();
+
+        // IMAP
+        testAccount = ProviderTestUtils.setupAccount("pop", false, mMockContext);
+        testAuth = new HostAuth();
+        testAccount.mHostAuthRecv = testAuth;
+        testAuth.mAddress = "imap.google.com";
+        testAuth.mProtocol = "imap";
+        testAccount.save(mMockContext);
+        testStore = Store.getInstance(testAccount, getContext());
+        assertEquals(1, Store.sStores.size());
+        assertSame(testStore, Store.sStores.get(testAccount.mId));
+        Store.sStores.clear();
+
+        // Unknown
+        testAccount = ProviderTestUtils.setupAccount("unknown", false, mMockContext);
+        testAuth = new HostAuth();
+        testAuth.mAddress = "unknown.google.com";
+        testAuth.mProtocol = "unknown";
         try {
-            Store store = Store.getInstance(storeUri, getContext(), null);
-            fail("MessagingException expected from bogus URI scheme");
-        } catch (MessagingException me) {
-            // expected - fall through
+            testStore = Store.getInstance(testAccount, getContext());
+            fail("Store#getInstance() should have thrown an exception");
+        } catch (MessagingException expected) {
         }
+        assertEquals(0, Store.sStores.size());
     }
 
+    public void testUpdateMailbox() {
+        Mailbox testMailbox = new Mailbox();
+
+        Store.updateMailbox(testMailbox, 1L, "inbox", '/', true, Mailbox.TYPE_MAIL);
+        assertEquals(1L, testMailbox.mAccountKey);
+        assertEquals("inbox", testMailbox.mDisplayName);
+        assertEquals("inbox", testMailbox.mServerId);
+        assertEquals('/', testMailbox.mDelimiter);
+
+        Store.updateMailbox(testMailbox, 2L, "inbox/a", '/', true, Mailbox.TYPE_MAIL);
+        assertEquals(2L, testMailbox.mAccountKey);
+        assertEquals("a", testMailbox.mDisplayName);
+        assertEquals("inbox/a", testMailbox.mServerId);
+        assertEquals('/', testMailbox.mDelimiter);
+
+        Store.updateMailbox(testMailbox, 3L, "inbox/a/b/c/d", '/', true, Mailbox.TYPE_MAIL);
+        assertEquals(3L, testMailbox.mAccountKey);
+        assertEquals("d", testMailbox.mDisplayName);
+        assertEquals("inbox/a/b/c/d", testMailbox.mServerId);
+        assertEquals('/', testMailbox.mDelimiter);
+
+        Store.updateMailbox(testMailbox, 4L, "inbox/a/b/c", '\0', true, Mailbox.TYPE_MAIL);
+        assertEquals(4L, testMailbox.mAccountKey);
+        assertEquals("inbox/a/b/c", testMailbox.mDisplayName);
+        assertEquals("inbox/a/b/c", testMailbox.mServerId);
+        assertEquals('\0', testMailbox.mDelimiter);
+    }
 }

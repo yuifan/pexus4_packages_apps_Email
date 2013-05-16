@@ -17,33 +17,32 @@
 package com.android.email.activity.setup;
 
 import com.android.email.R;
-import com.android.email.provider.EmailContent;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.HostAuth;
 
+import android.content.Context;
 import android.content.Intent;
 import android.test.ActivityInstrumentationTestCase2;
 import android.test.UiThreadTest;
 import android.test.suitebuilder.annotation.MediumTest;
-import android.widget.Button;
 import android.widget.EditText;
 
-import java.net.URI;
 import java.net.URISyntaxException;
 
 /**
  * Tests of the basic UI logic in the Account Setup Incoming (IMAP / POP3) screen.
+ * You can run this entire test case with:
+ *   runtest -c com.android.email.activity.setup.AccountSetupIncomingTests email
  */
 @MediumTest
-public class AccountSetupIncomingTests extends 
+public class AccountSetupIncomingTests extends
         ActivityInstrumentationTestCase2<AccountSetupIncoming> {
-    
-    // borrowed from AccountSetupIncoming
-    private static final String EXTRA_ACCOUNT = "account";
 
     private AccountSetupIncoming mActivity;
+    private AccountSetupIncomingFragment mFragment;
     private EditText mServerView;
     private EditText mPasswordView;
-    private Button mNextButton;
-    
+
     public AccountSetupIncomingTests() {
         super(AccountSetupIncoming.class);
     }
@@ -62,74 +61,78 @@ public class AccountSetupIncomingTests extends
         Intent i = getTestIntent("imap://user:password@server.com:999");
         setActivityIntent(i);
     }
-    
+
     /**
      * Test processing with a complete, good URI -> good fields
      */
-    public void testGoodUri() {
+    public void testGoodUri()
+            throws URISyntaxException {
         Intent i = getTestIntent("imap://user:password@server.com:999");
         setActivityIntent(i);
         getActivityAndFields();
-        assertTrue(mNextButton.isEnabled());
+        assertTrue(mActivity.mNextButtonEnabled);
     }
-    
+
     /**
      * No user is not OK - not enabled
      */
-    public void testBadUriNoUser() {
+    public void testBadUriNoUser()
+            throws URISyntaxException {
         Intent i = getTestIntent("imap://:password@server.com:999");
         setActivityIntent(i);
         getActivityAndFields();
-        assertFalse(mNextButton.isEnabled());
+        assertFalse(mActivity.mNextButtonEnabled);
     }
-    
+
     /**
      * No password is not OK - not enabled
      */
-    public void testBadUriNoPassword() {
+    public void testBadUriNoPassword()
+            throws URISyntaxException {
         Intent i = getTestIntent("imap://user@server.com:999");
         setActivityIntent(i);
         getActivityAndFields();
-        assertFalse(mNextButton.isEnabled());
+        assertFalse(mActivity.mNextButtonEnabled);
     }
-    
+
     /**
      * No port is OK - still enabled
      */
-    public void testGoodUriNoPort() {
+    public void testGoodUriNoPort()
+            throws URISyntaxException {
         Intent i = getTestIntent("imap://user:password@server.com");
         setActivityIntent(i);
         getActivityAndFields();
-        assertTrue(mNextButton.isEnabled());
+        assertTrue(mActivity.mNextButtonEnabled);
     }
-        
+
     /**
      * Test for non-standard but OK server names
      */
     @UiThreadTest
     public void testGoodServerVariants() {
         getActivityAndFields();
-        assertTrue(mNextButton.isEnabled());
-        
+        assertTrue(mActivity.mNextButtonEnabled);
+
         mServerView.setText("  server.com  ");
-        assertTrue(mNextButton.isEnabled());
+        assertTrue(mActivity.mNextButtonEnabled);
     }
-        
+
     /**
      * Test for non-empty but non-OK server names
      */
     @UiThreadTest
     public void testBadServerVariants() {
         getActivityAndFields();
-        assertTrue(mNextButton.isEnabled());
-        
+        assertTrue(mActivity.mNextButtonEnabled);
+
         mServerView.setText("  ");
-        assertFalse(mNextButton.isEnabled());
-        
+        assertFalse(mActivity.mNextButtonEnabled);
+
         mServerView.setText("serv$er.com");
-        assertFalse(mNextButton.isEnabled());
+        assertFalse(mActivity.mNextButtonEnabled);
     }
-    
+
     /**
      * Test to confirm that passwords with leading or trailing spaces are accepted verbatim.
      */
@@ -157,13 +160,9 @@ public class AccountSetupIncomingTests extends
     private void checkPassword(String password, boolean expectNext) throws URISyntaxException {
         mPasswordView.setText(password);
         if (expectNext) {
-            assertTrue(mNextButton.isEnabled());
-            URI uri = mActivity.getUri();
-            String actualUserInfo = uri.getUserInfo();
-            String actualPassword = actualUserInfo.split(":", 2)[1];
-            assertEquals(password, actualPassword);
+            assertTrue(mActivity.mNextButtonEnabled);
         } else {
-            assertFalse(mNextButton.isEnabled());
+            assertFalse(mActivity.mNextButtonEnabled);
         }
     }
 
@@ -171,26 +170,28 @@ public class AccountSetupIncomingTests extends
      * TODO:  A series of tests to explore the logic around security models & ports
      * TODO:  A series of tests exploring differences between IMAP and POP3
      */
-        
+
     /**
      * Get the activity (which causes it to be started, using our intent) and get the UI fields
      */
     private void getActivityAndFields() {
         mActivity = getActivity();
+        mFragment = mActivity.mFragment;
         mServerView = (EditText) mActivity.findViewById(R.id.account_server);
         mPasswordView = (EditText) mActivity.findViewById(R.id.account_password);
-        mNextButton = (Button) mActivity.findViewById(R.id.next);
     }
-    
+
     /**
      * Create an intent with the Account in it
      */
-    private Intent getTestIntent(String storeUriString) {
-        EmailContent.Account account = new EmailContent.Account();
-        account.setStoreUri(getInstrumentation().getTargetContext(), storeUriString);
-        Intent i = new Intent(Intent.ACTION_MAIN);
-        i.putExtra(EXTRA_ACCOUNT, account);
-        return i;
+    private Intent getTestIntent(String storeUriString)
+            throws URISyntaxException {
+        Account account = new Account();
+        Context context = getInstrumentation().getTargetContext();
+        HostAuth auth = account.getOrCreateHostAuthRecv(context);
+        HostAuth.setHostAuthFromString(auth, storeUriString);
+        SetupData.init(SetupData.FLOW_MODE_NORMAL, account);
+        return new Intent(Intent.ACTION_MAIN);
     }
 
 }

@@ -18,29 +18,72 @@ package com.android.email;
 
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.net.Uri;
+import android.text.TextUtils;
 import android.util.Log;
 
+import com.android.emailcommon.Logging;
+import com.android.emailcommon.provider.Account;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+
+import java.util.HashSet;
 import java.util.UUID;
 
 public class Preferences {
 
     // Preferences file
-    private static final String PREFERENCES_FILE = "AndroidMail.Main";
+    public static final String PREFERENCES_FILE = "AndroidMail.Main";
 
     // Preferences field names
     private static final String ACCOUNT_UUIDS = "accountUuids";
-    private static final String DEFAULT_ACCOUNT_UUID = "defaultAccountUuid";
     private static final String ENABLE_DEBUG_LOGGING = "enableDebugLogging";
-    private static final String ENABLE_SENSITIVE_LOGGING = "enableSensitiveLogging";
     private static final String ENABLE_EXCHANGE_LOGGING = "enableExchangeLogging";
     private static final String ENABLE_EXCHANGE_FILE_LOGGING = "enableExchangeFileLogging";
+    private static final String INHIBIT_GRAPHICS_ACCELERATION = "inhibitGraphicsAcceleration";
+    private static final String FORCE_ONE_MINUTE_REFRESH = "forceOneMinuteRefresh";
+    private static final String ENABLE_STRICT_MODE = "enableStrictMode";
     private static final String DEVICE_UID = "deviceUID";
     private static final String ONE_TIME_INITIALIZATION_PROGRESS = "oneTimeInitializationProgress";
+    private static final String AUTO_ADVANCE_DIRECTION = "autoAdvance";
+    private static final String TEXT_ZOOM = "textZoom";
+    private static final String BACKGROUND_ATTACHMENTS = "backgroundAttachments";
+    private static final String TRUSTED_SENDERS = "trustedSenders";
+    private static final String LAST_ACCOUNT_USED = "lastAccountUsed";
+    private static final String REQUIRE_MANUAL_SYNC_DIALOG_SHOWN = "requireManualSyncDialogShown";
+
+    public static final int AUTO_ADVANCE_NEWER = 0;
+    public static final int AUTO_ADVANCE_OLDER = 1;
+    public static final int AUTO_ADVANCE_MESSAGE_LIST = 2;
+    // "move to older" was the behavior on older versions.
+    private static final int AUTO_ADVANCE_DEFAULT = AUTO_ADVANCE_OLDER;
+
+    // The following constants are used as offsets into R.array.general_preference_text_zoom_size.
+    public static final int TEXT_ZOOM_TINY = 0;
+    public static final int TEXT_ZOOM_SMALL = 1;
+    public static final int TEXT_ZOOM_NORMAL = 2;
+    public static final int TEXT_ZOOM_LARGE = 3;
+    public static final int TEXT_ZOOM_HUGE = 4;
+    // "normal" will be the default
+    public static final int TEXT_ZOOM_DEFAULT = TEXT_ZOOM_NORMAL;
+
+    // Starting something new here:
+    // REPLY_ALL is saved by the framework (CheckBoxPreference's parent, Preference).
+    // i.e. android:persistent=true in general_preferences.xml
+    public static final String REPLY_ALL = "reply_all";
+    // Reply All Default - when changing this, be sure to update general_preferences.xml
+    public static final boolean REPLY_ALL_DEFAULT = false;
 
     private static Preferences sPreferences;
 
-    final SharedPreferences mSharedPreferences;
+    private final SharedPreferences mSharedPreferences;
+
+    /**
+     * A set of trusted senders for whom images and external resources should automatically be
+     * loaded for.
+     * Lazilly created.
+     */
+    private HashSet<String> mTrustedSenders = null;
 
     private Preferences(Context context) {
         mSharedPreferences = context.getSharedPreferences(PREFERENCES_FILE, Context.MODE_PRIVATE);
@@ -59,98 +102,28 @@ public class Preferences {
         return sPreferences;
     }
 
-    /**
-     * Returns an array of the accounts on the system. If no accounts are
-     * registered the method returns an empty array.
-     */
-    public Account[] getAccounts() {
-        String accountUuids = mSharedPreferences.getString(ACCOUNT_UUIDS, null);
-        if (accountUuids == null || accountUuids.length() == 0) {
-            return new Account[] {};
-        }
-        String[] uuids = accountUuids.split(",");
-        Account[] accounts = new Account[uuids.length];
-        for (int i = 0, length = uuids.length; i < length; i++) {
-            accounts[i] = new Account(this, uuids[i]);
-        }
-        return accounts;
+    public static SharedPreferences getSharedPreferences(Context context) {
+        return getPreferences(context).mSharedPreferences;
     }
 
-    /**
-     * Get an account object by Uri, or return null if no account exists
-     * TODO: Merge hardcoded strings with the same strings in Account.java
-     */
-    public Account getAccountByContentUri(Uri uri) {
-        if (!"content".equals(uri.getScheme()) || !"accounts".equals(uri.getAuthority())) {
-            return null;
-        }
-        String uuid = uri.getPath().substring(1);
-        if (uuid == null) {
-            return null;
-        }
-        String accountUuids = mSharedPreferences.getString(ACCOUNT_UUIDS, null);
-        if (accountUuids == null || accountUuids.length() == 0) {
-            return null;
-        }
-        String[] uuids = accountUuids.split(",");
-        for (int i = 0, length = uuids.length; i < length; i++) {
-            if (uuid.equals(uuids[i])) {
-                return new Account(this, uuid);
-            }
-        }
-        return null;
+    public static String getLegacyBackupPreference(Context context) {
+        return getPreferences(context).mSharedPreferences.getString(ACCOUNT_UUIDS, null);
     }
 
-    /**
-     * Returns the Account marked as default. If no account is marked as default
-     * the first account in the list is marked as default and then returned. If
-     * there are no accounts on the system the method returns null.
-     */
-    public Account getDefaultAccount() {
-        String defaultAccountUuid = mSharedPreferences.getString(DEFAULT_ACCOUNT_UUID, null);
-        Account defaultAccount = null;
-        Account[] accounts = getAccounts();
-        if (defaultAccountUuid != null) {
-            for (Account account : accounts) {
-                if (account.getUuid().equals(defaultAccountUuid)) {
-                    defaultAccount = account;
-                    break;
-                }
-            }
-        }
-
-        if (defaultAccount == null) {
-            if (accounts.length > 0) {
-                defaultAccount = accounts[0];
-                setDefaultAccount(defaultAccount);
-            }
-        }
-
-        return defaultAccount;
-    }
-
-    public void setDefaultAccount(Account account) {
-        mSharedPreferences.edit().putString(DEFAULT_ACCOUNT_UUID, account.getUuid()).commit();
+    public static void clearLegacyBackupPreference(Context context) {
+        getPreferences(context).mSharedPreferences.edit().remove(ACCOUNT_UUIDS).apply();
     }
 
     public void setEnableDebugLogging(boolean value) {
-        mSharedPreferences.edit().putBoolean(ENABLE_DEBUG_LOGGING, value).commit();
+        mSharedPreferences.edit().putBoolean(ENABLE_DEBUG_LOGGING, value).apply();
     }
 
     public boolean getEnableDebugLogging() {
         return mSharedPreferences.getBoolean(ENABLE_DEBUG_LOGGING, false);
     }
 
-    public void setEnableSensitiveLogging(boolean value) {
-        mSharedPreferences.edit().putBoolean(ENABLE_SENSITIVE_LOGGING, value).commit();
-    }
-
-    public boolean getEnableSensitiveLogging() {
-        return mSharedPreferences.getBoolean(ENABLE_SENSITIVE_LOGGING, false);
-    }
-
     public void setEnableExchangeLogging(boolean value) {
-        mSharedPreferences.edit().putBoolean(ENABLE_EXCHANGE_LOGGING, value).commit();
+        mSharedPreferences.edit().putBoolean(ENABLE_EXCHANGE_LOGGING, value).apply();
     }
 
     public boolean getEnableExchangeLogging() {
@@ -158,11 +131,35 @@ public class Preferences {
     }
 
     public void setEnableExchangeFileLogging(boolean value) {
-        mSharedPreferences.edit().putBoolean(ENABLE_EXCHANGE_FILE_LOGGING, value).commit();
+        mSharedPreferences.edit().putBoolean(ENABLE_EXCHANGE_FILE_LOGGING, value).apply();
     }
 
     public boolean getEnableExchangeFileLogging() {
         return mSharedPreferences.getBoolean(ENABLE_EXCHANGE_FILE_LOGGING, false);
+    }
+
+    public void setInhibitGraphicsAcceleration(boolean value) {
+        mSharedPreferences.edit().putBoolean(INHIBIT_GRAPHICS_ACCELERATION, value).apply();
+    }
+
+    public boolean getInhibitGraphicsAcceleration() {
+        return mSharedPreferences.getBoolean(INHIBIT_GRAPHICS_ACCELERATION, false);
+    }
+
+    public void setForceOneMinuteRefresh(boolean value) {
+        mSharedPreferences.edit().putBoolean(FORCE_ONE_MINUTE_REFRESH, value).apply();
+    }
+
+    public boolean getForceOneMinuteRefresh() {
+        return mSharedPreferences.getBoolean(FORCE_ONE_MINUTE_REFRESH, false);
+    }
+
+    public void setEnableStrictMode(boolean value) {
+        mSharedPreferences.edit().putBoolean(ENABLE_STRICT_MODE, value).apply();
+    }
+
+    public boolean getEnableStrictMode() {
+        return mSharedPreferences.getBoolean(ENABLE_STRICT_MODE, false);
     }
 
     /**
@@ -174,7 +171,7 @@ public class Preferences {
          String result = mSharedPreferences.getString(DEVICE_UID, null);
          if (result == null) {
              result = UUID.randomUUID().toString();
-             mSharedPreferences.edit().putString(DEVICE_UID, result).commit();
+             mSharedPreferences.edit().putString(DEVICE_UID, result).apply();
          }
          return result;
     }
@@ -184,21 +181,171 @@ public class Preferences {
     }
 
     public void setOneTimeInitializationProgress(int progress) {
-        mSharedPreferences.edit().putInt(ONE_TIME_INITIALIZATION_PROGRESS, progress).commit();
+        mSharedPreferences.edit().putInt(ONE_TIME_INITIALIZATION_PROGRESS, progress).apply();
     }
 
-    public void save() {
+    public int getAutoAdvanceDirection() {
+        return mSharedPreferences.getInt(AUTO_ADVANCE_DIRECTION, AUTO_ADVANCE_DEFAULT);
+    }
+
+    public void setAutoAdvanceDirection(int direction) {
+        mSharedPreferences.edit().putInt(AUTO_ADVANCE_DIRECTION, direction).apply();
+    }
+
+    public int getTextZoom() {
+        return mSharedPreferences.getInt(TEXT_ZOOM, TEXT_ZOOM_DEFAULT);
+    }
+
+    public void setTextZoom(int zoom) {
+        mSharedPreferences.edit().putInt(TEXT_ZOOM, zoom).apply();
+    }
+
+    public boolean getBackgroundAttachments() {
+        return mSharedPreferences.getBoolean(BACKGROUND_ATTACHMENTS, false);
+    }
+
+    public void setBackgroundAttachments(boolean allowed) {
+        mSharedPreferences.edit().putBoolean(BACKGROUND_ATTACHMENTS, allowed).apply();
+    }
+
+    /**
+     * Determines whether or not a sender should be trusted and images should automatically be
+     * shown for messages by that sender.
+     */
+    public boolean shouldShowImagesFor(String email) {
+        if (mTrustedSenders == null) {
+            try {
+                mTrustedSenders = parseEmailSet(mSharedPreferences.getString(TRUSTED_SENDERS, ""));
+            } catch (JSONException e) {
+                // Something went wrong, and the data is corrupt. Just clear it to be safe.
+                Log.w(Logging.LOG_TAG, "Trusted sender set corrupted. Clearing");
+                mSharedPreferences.edit().putString(TRUSTED_SENDERS, "").apply();
+                mTrustedSenders = new HashSet<String>();
+            }
+        }
+        return mTrustedSenders.contains(email);
+    }
+
+    /**
+     * Marks a sender as trusted so that images from that sender will automatically be shown.
+     */
+    public void setSenderAsTrusted(String email) {
+        if (!mTrustedSenders.contains(email)) {
+            mTrustedSenders.add(email);
+            mSharedPreferences
+                    .edit()
+                    .putString(TRUSTED_SENDERS, packEmailSet(mTrustedSenders))
+                    .apply();
+        }
+    }
+
+    /**
+     * Clears all trusted senders asynchronously.
+     */
+    public void clearTrustedSenders() {
+        mTrustedSenders = new HashSet<String>();
+        mSharedPreferences
+                .edit()
+                .putString(TRUSTED_SENDERS, packEmailSet(mTrustedSenders))
+                .apply();
+    }
+
+    HashSet<String> parseEmailSet(String serialized) throws JSONException {
+        HashSet<String> result = new HashSet<String>();
+        if (!TextUtils.isEmpty(serialized)) {
+            JSONArray arr = new JSONArray(serialized);
+            for (int i = 0, len = arr.length(); i < len; i++) {
+                result.add((String) arr.get(i));
+            }
+        }
+        return result;
+    }
+
+    String packEmailSet(HashSet<String> set) {
+        return new JSONArray(set).toString();
+    }
+
+    /**
+     * Returns the last used account ID as set by {@link #setLastUsedAccountId}.
+     * The system makes no attempt to automatically track what is considered a "use" - clients
+     * are expected to call {@link #setLastUsedAccountId} manually.
+     *
+     * Note that the last used account may have been deleted in the background so there is also
+     * no guarantee that the account exists.
+     */
+    public long getLastUsedAccountId() {
+        return mSharedPreferences.getLong(LAST_ACCOUNT_USED, Account.NO_ACCOUNT);
+    }
+
+    /**
+     * Sets the specified ID of the last account used. Treated as an opaque ID and does not
+     * validate the value. Value is saved asynchronously.
+     */
+    public void setLastUsedAccountId(long accountId) {
+        mSharedPreferences
+                .edit()
+                .putLong(LAST_ACCOUNT_USED, accountId)
+                .apply();
+    }
+
+    /**
+     * Gets whether the require manual sync dialog has been shown for the specified account.
+     * It should only be shown once per account.
+     */
+    public boolean getHasShownRequireManualSync(Context context, Account account) {
+        return getBoolean(context, account.getEmailAddress(), REQUIRE_MANUAL_SYNC_DIALOG_SHOWN,
+                false);
+    }
+
+    /**
+     * Sets whether the require manual sync dialog has been shown for the specified account.
+     * It should only be shown once per account.
+     */
+    public void setHasShownRequireManualSync(Context context, Account account, boolean value) {
+        setBoolean(context, account.getEmailAddress(), REQUIRE_MANUAL_SYNC_DIALOG_SHOWN, value);
+    }
+
+
+    /**
+     * Get whether to show the manual sync dialog. This dialog is shown when the user is roaming,
+     * connected to a mobile network, the administrator has set the RequireManualSyncWhenRoaming
+     * flag to true, and the dialog has not been shown before for the supplied account.
+     */
+    public boolean shouldShowRequireManualSync(Context context, Account account) {
+        return Account.isAutomaticSyncDisabledByRoaming(context, account.mId)
+                && !getHasShownRequireManualSync(context, account);
     }
 
     public void clear() {
-        mSharedPreferences.edit().clear().commit();
+        mSharedPreferences.edit().clear().apply();
     }
 
     public void dump() {
-        if (Email.LOGD) {
+        if (Logging.LOGD) {
             for (String key : mSharedPreferences.getAll().keySet()) {
-                Log.v(Email.LOG_TAG, key + " = " + mSharedPreferences.getAll().get(key));
+                Log.v(Logging.LOG_TAG, key + " = " + mSharedPreferences.getAll().get(key));
             }
         }
+    }
+
+    /**
+     * Utility method for setting a boolean value on a per-account preference.
+     */
+    private void setBoolean(Context context, String account, String key, Boolean value) {
+        mSharedPreferences.edit().putBoolean(makeKey(account, key), value).apply();
+    }
+
+    /**
+     * Utility method for getting a boolean value from a per-account preference.
+     */
+    private boolean getBoolean(Context context, String account, String key, boolean def) {
+        return mSharedPreferences.getBoolean(makeKey(account, key), def);
+    }
+
+    /**
+     * Utility method for creating a per account preference key.
+     */
+    private String makeKey(String account, String key) {
+        return account != null ? account + "-" + key : key;
     }
 }

@@ -19,8 +19,7 @@
 
 package org.apache.james.mime4j;
 
-import com.android.email.Email;
-import com.android.email.mail.transport.LoggingInputStream;
+import com.android.mail.utils.LoggingInputStream;
 
 import org.apache.james.mime4j.decoder.Base64InputStream;
 import org.apache.james.mime4j.decoder.QuotedPrintableInputStream;
@@ -32,7 +31,7 @@ import java.util.LinkedList;
 
 /**
  * <p>
- * Parses MIME (or RFC822) message streams of bytes or characters and reports 
+ * Parses MIME (or RFC822) message streams of bytes or characters and reports
  * parsing events to a <code>ContentHandler</code> instance.
  * </p>
  * <p>
@@ -43,11 +42,11 @@ import java.util.LinkedList;
  *      parser.setContentHandler(handler);
  *      parser.parse(new BufferedInputStream(new FileInputStream("mime.msg")));
  * </pre>
- * <strong>NOTE:</strong> All lines must end with CRLF 
- * (<code>\r\n</code>). If you are unsure of the line endings in your stream 
+ * <strong>NOTE:</strong> All lines must end with CRLF
+ * (<code>\r\n</code>). If you are unsure of the line endings in your stream
  * you should wrap it in a {@link org.apache.james.mime4j.EOLConvertingInputStream} instance.
  *
- * 
+ *
  * @version $Id: MimeStreamParser.java,v 1.8 2005/02/11 10:12:02 ntherning Exp $
  */
 public class MimeStreamParser {
@@ -56,12 +55,12 @@ public class MimeStreamParser {
     private static final boolean DEBUG_LOG_MESSAGE = false; //DO NOT RELEASE AS 'TRUE'
 
     private static BitSet fieldChars = null;
-    
+
     private RootInputStream rootStream = null;
-    private LinkedList bodyDescriptors = new LinkedList();
+    private LinkedList<BodyDescriptor> bodyDescriptors = new LinkedList<BodyDescriptor>();
     private ContentHandler handler = null;
     private boolean raw = false;
-    
+
     static {
         fieldChars = new BitSet();
         for (int i = 0x21; i <= 0x39; i++) {
@@ -71,7 +70,7 @@ public class MimeStreamParser {
             fieldChars.set(i);
         }
     }
-    
+
     /**
      * Creates a new <code>MimeStreamParser</code> instance.
      */
@@ -80,21 +79,21 @@ public class MimeStreamParser {
 
     /**
      * Parses a stream of bytes containing a MIME message.
-     * 
+     *
      * @param is the stream to parse.
      * @throws IOException on I/O errors.
      */
     public void parse(InputStream is) throws IOException {
-        if (DEBUG_LOG_MESSAGE && Email.DEBUG) {
+        if (DEBUG_LOG_MESSAGE) {
             is = new LoggingInputStream(is, "MIME", true);
         }
         rootStream = new RootInputStream(is);
         parseMessage(rootStream);
     }
-    
+
     /**
      * Determines if this parser is currently in raw mode.
-     * 
+     *
      * @return <code>true</code> if in raw mode, <code>false</code>
      *         otherwise.
      * @see #setRaw(boolean)
@@ -102,29 +101,29 @@ public class MimeStreamParser {
     public boolean isRaw() {
         return raw;
     }
-    
+
     /**
-     * Enables or disables raw mode. In raw mode all future entities 
+     * Enables or disables raw mode. In raw mode all future entities
      * (messages or body parts) in the stream will be reported to the
      * {@link ContentHandler#raw(InputStream)} handler method only.
-     * The stream will contain the entire unparsed entity contents 
+     * The stream will contain the entire unparsed entity contents
      * including header fields and whatever is in the body.
-     * 
+     *
      * @param raw <code>true</code> enables raw mode, <code>false</code>
      *        disables it.
      */
     public void setRaw(boolean raw) {
         this.raw = raw;
     }
-    
+
     /**
      * Finishes the parsing and stops reading lines.
      * NOTE: No more lines will be parsed but the parser
-     * will still call 
+     * will still call
      * {@link ContentHandler#endMultipart()},
      * {@link ContentHandler#endBodyPart()},
      * {@link ContentHandler#endMessage()}, etc to match previous calls
-     * to 
+     * to
      * {@link ContentHandler#startMultipart(BodyDescriptor)},
      * {@link ContentHandler#startBodyPart()},
      * {@link ContentHandler#startMessage()}, etc.
@@ -132,23 +131,23 @@ public class MimeStreamParser {
     public void stop() {
         rootStream.truncate();
     }
-    
+
     /**
      * Parses an entity which consists of a header followed by a body containing
      * arbitrary data, body parts or an embedded message.
-     * 
+     *
      * @param is the stream to parse.
      * @throws IOException on I/O errors.
      */
     private void parseEntity(InputStream is) throws IOException {
         BodyDescriptor bd = parseHeader(is);
-        
+
         if (bd.isMultipart()) {
             bodyDescriptors.addFirst(bd);
-            
+
             handler.startMultipart(bd);
-            
-            MimeBoundaryInputStream tempIs = 
+
+            MimeBoundaryInputStream tempIs =
                 new MimeBoundaryInputStream(is, bd.getBoundary());
             handler.preamble(new CloseShieldInputStream(tempIs));
             tempIs.consume();
@@ -158,22 +157,22 @@ public class MimeStreamParser {
                 parseBodyPart(tempIs);
                 tempIs.consume();
                 if (tempIs.parentEOF()) {
-                    if (log.isWarnEnabled()) {
-                        log.warn("Line " + rootStream.getLineNumber() 
-                                + ": Body part ended prematurely. "
-                                + "Higher level boundary detected or "
-                                + "EOF reached.");
-                    }
+//                    if (log.isWarnEnabled()) {
+//                        log.warn("Line " + rootStream.getLineNumber()
+//                                + ": Body part ended prematurely. "
+//                                + "Higher level boundary detected or "
+//                                + "EOF reached.");
+//                    }
                     break;
                 }
             }
-            
+
             handler.epilogue(new CloseShieldInputStream(is));
-            
+
             handler.endMultipart();
-            
+
             bodyDescriptors.removeFirst();
-            
+
         } else if (bd.isMessage()) {
             if (bd.isBase64Encoded()) {
                 log.warn("base64 encoded message/rfc822 detected");
@@ -190,14 +189,14 @@ public class MimeStreamParser {
         } else {
             handler.body(bd, new CloseShieldInputStream(is));
         }
-        
+
         /*
          * Make sure the stream has been consumed.
          */
         while (is.read() != -1) {
         }
     }
-    
+
     private void parseMessage(InputStream is) throws IOException {
         if (raw) {
             handler.raw(new CloseShieldInputStream(is));
@@ -207,7 +206,7 @@ public class MimeStreamParser {
             handler.endMessage();
         }
     }
-    
+
     private void parseBodyPart(InputStream is) throws IOException {
         if (raw) {
             handler.raw(new CloseShieldInputStream(is));
@@ -217,22 +216,22 @@ public class MimeStreamParser {
             handler.endBodyPart();
         }
     }
-    
+
     /**
      * Parses a header.
-     * 
+     *
      * @param is the stream to parse.
-     * @return a <code>BodyDescriptor</code> describing the body following 
+     * @return a <code>BodyDescriptor</code> describing the body following
      *         the header.
      */
     private BodyDescriptor parseHeader(InputStream is) throws IOException {
-        BodyDescriptor bd = new BodyDescriptor(bodyDescriptors.isEmpty() 
+        BodyDescriptor bd = new BodyDescriptor(bodyDescriptors.isEmpty()
                         ? null : (BodyDescriptor) bodyDescriptors.getFirst());
-        
+
         handler.startHeader();
-        
+
         int lineNumber = rootStream.getLineNumber();
-        
+
         StringBuffer sb = new StringBuffer();
         int curr = 0;
         int prev = 0;
@@ -247,12 +246,12 @@ public class MimeStreamParser {
             sb.append((char) curr);
             prev = curr == '\r' ? prev : curr;
         }
-        
-        if (curr == -1 && log.isWarnEnabled()) {
-            log.warn("Line " + rootStream.getLineNumber()  
-                    + ": Unexpected end of headers detected. "
-                    + "Boundary detected in header or EOF reached.");
-        }
+
+//        if (curr == -1 && log.isWarnEnabled()) {
+//            log.warn("Line " + rootStream.getLineNumber()
+//                    + ": Unexpected end of headers detected. "
+//                    + "Boundary detected in header or EOF reached.");
+//        }
 
         int start = 0;
         int pos = 0;
@@ -265,16 +264,16 @@ public class MimeStreamParser {
                 pos++;
                 continue;
             }
-            
+
             if (pos >= sb.length() - 2 || fieldChars.get(sb.charAt(pos + 2))) {
-                
+
                 /*
-                 * field should be the complete field data excluding the 
+                 * field should be the complete field data excluding the
                  * trailing \r\n.
                  */
                 String field = sb.substring(start, pos);
                 start = pos + 2;
-                
+
                 /*
                  * Check for a valid field.
                  */
@@ -289,34 +288,34 @@ public class MimeStreamParser {
                             break;
                         }
                     }
-                    
+
                     if (valid) {
                         handler.field(field);
                         bd.addField(fieldName, field.substring(index + 1));
-                    }                        
+                    }
                 }
-                
+
                 if (!valid && log.isWarnEnabled()) {
-                    log.warn("Line " + startLineNumber 
+                    log.warn("Line " + startLineNumber
                             + ": Ignoring invalid field: '" + field.trim() + "'");
-                }          
-                
+                }
+
                 startLineNumber = lineNumber;
             }
-            
+
             pos += 2;
             lineNumber++;
         }
-        
+
         handler.endHeader();
-        
+
         return bd;
     }
-    
+
     /**
-     * Sets the <code>ContentHandler</code> to use when reporting 
+     * Sets the <code>ContentHandler</code> to use when reporting
      * parsing events.
-     * 
+     *
      * @param h the <code>ContentHandler</code>.
      */
     public void setContentHandler(ContentHandler h) {

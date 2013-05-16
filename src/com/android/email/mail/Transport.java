@@ -16,66 +16,63 @@
 
 package com.android.email.mail;
 
+import com.android.emailcommon.mail.CertificateValidationException;
+import com.android.emailcommon.mail.MessagingException;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.SocketException;
-import java.net.URI;
 
 /**
- * This interface defines a "transport", which is defined here as being one layer below the 
- * specific wire protocols such as POP3, IMAP, or SMTP.  
- * 
+ * This interface defines a "transport", which is defined here as being one layer below the
+ * specific wire protocols such as POP3, IMAP, or SMTP.
+ *
  * Practically speaking, it provides a definition of the common functionality between them
  * (dealing with sockets & streams, SSL, logging, and so forth), and provides a seam just below
  * the individual protocols to enable better testing.
- * 
+ *
  * The following features are supported and presumed to be common:
- * 
+ *
  *  Interpretation of URI
  *  Support for SSL and TLS wireline security
  */
-public interface Transport {
-    
+public interface Transport extends Cloneable {
+
     /**
      * Connection security options for transport that supports SSL and/or TLS
      */
     public static final int CONNECTION_SECURITY_NONE = 0;
     public static final int CONNECTION_SECURITY_SSL = 1;
     public static final int CONNECTION_SECURITY_TLS = 2;
-    
+
     /**
      * Get a new transport, using an existing one as a model.  The new transport is configured as if
      * setUri() and setSecurity() have been called, but not opened or connected in any way.
      * @return a new Transport ready to open()
      */
-    public Transport newInstanceWithConfiguration();
+    public Transport clone();
 
     /**
-     * Set the Uri for the connection.
-     * 
-     * @param uri The Uri for the connection
-     * @param defaultPort If the Uri does not include an explicit port, this value will be used.
+     * Sets the host
      */
-    public void setUri(URI uri, int defaultPort);
-    
+    public void setHost(String host);
+
     /**
-     * @return Returns the host part of the Uri
+     * Sets the port
+     */
+    public void setPort(int port);
+
+    /**
+     * Returns the host or {@code null} if none was specified.
      */
     public String getHost();
-    
+
     /**
-     * @return Returns the port (either from the Uri or from the default)
+     * Returns the port or {@code 0} if none was specified.
      */
     public int getPort();
-    
-    /**
-     * Returns the user info parts of the Uri, if any were supplied.  Typically, [0] is the user 
-     * and [1] is the password.
-     * @return Returns the user info parts of the Uri.  Null if none were supplied.
-     */
-    public String[] getUserInfoParts();
 
     /**
      * Set the desired security mode for this connection.
@@ -83,17 +80,17 @@ public interface Transport {
      * @param trustAllCertificates true to allow unverifiable certificates to be used
      */
     public void setSecurity(int connectionSecurity, boolean trustAllCertificates);
-    
+
     /**
      * @return Returns the desired security mode for this connection.
      */
     public int getSecurity();
-    
+
     /**
      * @return true if the security mode indicates that SSL is possible
      */
     public boolean canTrySslSecurity();
-    
+
     /**
      * @return true if the security mode indicates that TLS is possible
      */
@@ -115,35 +112,35 @@ public interface Transport {
      * Attempts to open the connection using the supplied parameters, and using SSL if indicated.
      */
     public void open() throws MessagingException, CertificateValidationException;
-    
+
     /**
      * Attempts to reopen the connection using TLS.
      */
     public void reopenTls() throws MessagingException;
-    
+
     /**
      * @return true if the connection is open
      */
     public boolean isOpen();
-    
+
     /**
      * Closes the connection.  Does not send any closure messages, simply closes the socket and the
-     * associated streams.  Best effort only.  Catches all exceptions and always returns.  
-     * 
+     * associated streams.  Best effort only.  Catches all exceptions and always returns.
+     *
      * MUST NOT throw any exceptions.
      */
     public void close();
-    
+
     /**
      * @return returns the active input stream
      */
     public InputStream getInputStream();
-    
+
     /**
      * @return returns the active output stream
      */
     public OutputStream getOutputStream();
-    
+
     /**
      * Write a single line to the server, and may generate a log entry (if enabled).
      * @param s The text to send to the server.
@@ -151,7 +148,7 @@ public interface Transport {
      * please pass a replacement string here (for logging).  Most callers simply pass null,
      */
     void writeLine(String s, String sensitiveReplacement) throws IOException;
-    
+
     /**
      * Reads a single line from the server.  Any delimiter characters will not be included in the
      * result.  May generate a log entry, if enabled.

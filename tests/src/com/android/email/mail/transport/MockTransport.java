@@ -24,7 +24,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.regex.Pattern;
@@ -163,14 +162,17 @@ public class MockTransport implements Transport {
         }
     }
 
+    @Override
     public boolean canTrySslSecurity() {
         return (mConnectionSecurity == CONNECTION_SECURITY_SSL);
     }
 
+    @Override
     public boolean canTryTlsSecurity() {
         return (mConnectionSecurity == Transport.CONNECTION_SECURITY_TLS);
     }
 
+    @Override
     public boolean canTrustAllCertificates() {
         return mTrustCertificates;
     }
@@ -190,6 +192,7 @@ public class MockTransport implements Transport {
         mInputOpen = false;
     }
 
+    @Override
     public void close() {
         mOpen = false;
         mInputOpen = false;
@@ -204,14 +207,12 @@ public class MockTransport implements Transport {
         mPairs.clear();
     }
 
-    /**
-     * This is a test function (not part of the interface) and is used to set up a result
-     * value for getHost(), if needed for the test.
-     */
-    public void setMockHost(String host) {
+    @Override
+    public void setHost(String host) {
         mHost = host;
     }
 
+    @Override
     public String getHost() {
         return mHost;
     }
@@ -220,6 +221,7 @@ public class MockTransport implements Transport {
         mLocalAddress = address;
     }
 
+    @Override
     public InputStream getInputStream() {
         SmtpSenderUnitTests.assertTrue(mOpen);
         return new MockInputStream();
@@ -230,33 +232,39 @@ public class MockTransport implements Transport {
      * until we need something more complex, we'll just return the actual MockTransport.  Then we
      * don't have to worry about dealing with test metadata like the expects list or socket state.
      */
-    public Transport newInstanceWithConfiguration() {
+    @Override
+    public Transport clone() {
          return this;
     }
 
+    @Override
     public OutputStream getOutputStream() {
         Assert.assertTrue(mOpen);
         return new MockOutputStream();
     }
 
+    @Override
+    public void setPort(int port) {
+        SmtpSenderUnitTests.fail("setPort() not implemented");
+    }
+
+    @Override
     public int getPort() {
         SmtpSenderUnitTests.fail("getPort() not implemented");
         return 0;
     }
 
+    @Override
     public int getSecurity() {
         return mConnectionSecurity;
     }
 
-    public String[] getUserInfoParts() {
-        SmtpSenderUnitTests.fail("getUserInfoParts() not implemented");
-        return null;
-    }
-
+    @Override
     public boolean isOpen() {
         return mOpen;
     }
 
+    @Override
     public void open() /* throws MessagingException, CertificateValidationException */ {
         mOpen = true;
         mInputOpen = true;
@@ -272,6 +280,7 @@ public class MockTransport implements Transport {
      *
      * Logs the read text if DEBUG_LOG_STREAMS is true.
      */
+    @Override
     public String readLine() throws IOException {
         SmtpSenderUnitTests.assertTrue(mOpen);
         if (!mInputOpen) {
@@ -300,6 +309,7 @@ public class MockTransport implements Transport {
         return line;
     }
 
+    @Override
     public void reopenTls() /* throws MessagingException */ {
         SmtpSenderUnitTests.assertTrue(mOpen);
         Transaction expect = mPairs.remove(0);
@@ -307,16 +317,14 @@ public class MockTransport implements Transport {
         mTlsStarted = true;
     }
 
+    @Override
     public void setSecurity(int connectionSecurity, boolean trustAllCertificates) {
         mConnectionSecurity = connectionSecurity;
         mTrustCertificates = trustAllCertificates;
     }
 
+    @Override
     public void setSoTimeout(int timeoutMilliseconds) /* throws SocketException */ {
-    }
-
-    public void setUri(URI uri, int defaultPort) {
-        SmtpSenderUnitTests.assertTrue("Don't call setUri on a mock transport", false);
     }
 
     /**
@@ -328,6 +336,7 @@ public class MockTransport implements Transport {
      *
      * Logs the written text if DEBUG_LOG_STREAMS is true.
      */
+    @Override
     public void writeLine(String s, String sensitiveReplacement) throws IOException {
         if (DEBUG_LOG_STREAMS) {
             Log.d(LOG_TAG, ">>> " + s);
@@ -352,8 +361,8 @@ public class MockTransport implements Transport {
      */
     private class MockInputStream extends InputStream {
 
-        byte[] mNextLine = null;
-        int mNextIndex = 0;
+        private byte[] mNextLine = null;
+        private int mNextIndex = 0;
 
         /**
          * Reads from the same input buffer as readLine()
@@ -390,7 +399,7 @@ public class MockTransport implements Transport {
      */
     private class MockOutputStream extends OutputStream {
 
-        StringBuilder sb = new StringBuilder();
+        private StringBuilder sb = new StringBuilder();
 
         @Override
         public void write(int oneByte) throws IOException {
@@ -406,6 +415,7 @@ public class MockTransport implements Transport {
         }
     }
 
+    @Override
     public InetAddress getLocalAddress() {
         if (isOpen()) {
             return mLocalAddress;

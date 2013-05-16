@@ -4,9 +4,9 @@
      Licensed under the Apache License, Version 2.0 (the "License");
      you may not use this file except in compliance with the License.
      You may obtain a copy of the License at
-  
+
           http://www.apache.org/licenses/LICENSE-2.0
-  
+
      Unless required by applicable law or agreed to in writing, software
      distributed under the License is distributed on an "AS IS" BASIS,
      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,81 +14,61 @@
      limitations under the License.
 -->
 
+<!-- Small-screen holder - see layout-xlarge for large-screen version -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:fillViewport="true">
 
-    <LinearLayout
+    <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical" >
+        android:layout_height="match_parent"
+        android:paddingTop="@dimen/setup_fragment_padding_top"
+        android:paddingLeft="@dimen/setup_fragment_padding_left"
+        android:paddingRight="@dimen/setup_fragment_padding_right"
+        >
 
-        <LinearLayout
+        <!-- Frame on the left containing the (common) setup info -->
+        <!-- TODO need phone-sized UX here -->
+        <FrameLayout
+            android:id="@+id/common"
+            android:layout_below="@+id/top_divider"
+            android:layout_alignParentLeft="true"
+            android:layout_alignParentRight="true"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:orientation="vertical" >
-            <TextView
-                android:id="@+id/instructions"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="10dip"
-                android:textSize="20sp"
-                android:text="@string/accounts_welcome"
-                android:textColor="?android:attr/textColorPrimary" />
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="0dip"
-                android:layout_weight="1" />
-            <EditText
-                android:id="@+id/account_email"
-                android:hint="@string/account_setup_basics_email_hint"
-                android:inputType="textEmailAddress"
-                android:imeOptions="actionNext"
-                android:layout_height="wrap_content"
-                android:layout_width="match_parent" />
-            <EditText
-                android:id="@+id/account_password"
-                android:hint="@string/account_setup_basics_password_hint"
-                android:inputType="textPassword"
-                android:imeOptions="actionDone"
-                android:layout_height="wrap_content"
-                android:layout_width="match_parent"
-                android:nextFocusDown="@+id/next" />
-            <CheckBox
-                android:id="@+id/account_default"
-                android:layout_height="wrap_content"
-                android:layout_width="match_parent"
-                android:text="@string/account_setup_basics_default_label"
-                android:visibility="gone" />
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="0dip"
-                android:layout_weight="1" />
-        </LinearLayout>
+            >
+            <include
+                layout="@layout/account_setup_basics_common"
+                />
+        </FrameLayout>
 
-        <RelativeLayout
+        <!-- Buttons below -->
+        <!-- In order to show these buttons above the IME keyboard, we need to special case the to
+        padding to a smaller height. -->
+        <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="54dip"
-            android:background="@android:drawable/bottom_bar" >
+            android:layout_height="wrap_content"
+            android:layout_below="@+id/common"
+            android:orientation="horizontal"
+            android:paddingTop="16dip"
+            android:paddingBottom="@dimen/settings_buttons_padding_bottom"
+            >
             <Button
                 android:id="@+id/manual_setup"
-                android:text="@string/account_setup_basics_manual_setup_action"
-                android:layout_height="wrap_content"
-                android:layout_width="wrap_content"
-                android:minWidth="@dimen/button_minWidth"
-                android:layout_alignParentLeft="true"
-                android:layout_centerVertical="true" />
+                style="@style/accountSetupButton"
+                android:layout_width="0dip"
+                android:layout_weight="1"
+                android:text="@string/account_setup_basics_manual_setup_action" />
             <Button
                 android:id="@+id/next"
-                android:text="@string/next_action"
-                android:layout_height="wrap_content"
-                android:layout_width="wrap_content"
-                android:minWidth="@dimen/button_minWidth"
-                android:drawableRight="@drawable/button_indicator_next"
-                android:layout_alignParentRight="true"
-                android:layout_centerVertical="true" />
-        </RelativeLayout>
-    </LinearLayout>
+                style="@style/accountSetupButton"
+                android:layout_width="0dip"
+                android:layout_weight="1"
+                android:text="@string/next_action" />
+        </LinearLayout>
+
+    </RelativeLayout>
+
 </ScrollView>

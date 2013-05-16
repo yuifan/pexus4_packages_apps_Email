@@ -16,16 +16,17 @@
 
 package com.android.email;
 
-import com.android.email.provider.EmailProvider;
-import com.android.email.provider.ProviderTestUtils;
-import com.android.email.provider.EmailContent.Account;
-
 import android.accounts.AccountManager;
 import android.accounts.AccountManagerFuture;
 import android.accounts.AuthenticatorException;
 import android.accounts.OperationCanceledException;
 import android.database.Cursor;
 import android.test.ProviderTestCase2;
+
+import com.android.email.provider.EmailProvider;
+import com.android.email.provider.ProviderTestUtils;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.EmailContent;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -38,18 +39,18 @@ public abstract class AccountTestCase extends ProviderTestCase2<EmailProvider> {
 
     protected static final String TEST_ACCOUNT_PREFIX = "__test";
     protected static final String TEST_ACCOUNT_SUFFIX = "@android.com";
+    protected static final String TEST_ACCOUNT_TYPE = "com.android.test_exchange";
 
     public AccountTestCase() {
-        super(EmailProvider.class, EmailProvider.EMAIL_AUTHORITY);
+        super(EmailProvider.class, EmailContent.AUTHORITY);
     }
 
     protected android.accounts.Account[] getExchangeAccounts() {
-        return AccountManager.get(getContext())
-                .getAccountsByType(Email.EXCHANGE_ACCOUNT_MANAGER_TYPE);
+        return AccountManager.get(getContext()).getAccountsByType(TEST_ACCOUNT_TYPE);
     }
 
     protected android.accounts.Account makeAccountManagerAccount(String username) {
-        return new android.accounts.Account(username, Email.EXCHANGE_ACCOUNT_MANAGER_TYPE);
+        return new android.accounts.Account(username, TEST_ACCOUNT_TYPE);
     }
 
     protected void createAccountManagerAccount(String username) {
@@ -64,13 +65,15 @@ public abstract class AccountTestCase extends ProviderTestCase2<EmailProvider> {
         return ProviderTestUtils.setupAccount(username, true, getMockContext());
     }
 
-    protected ArrayList<Account> makeSyncManagerAccountList() {
+    protected ArrayList<Account> makeExchangeServiceAccountList() {
         ArrayList<Account> accountList = new ArrayList<Account>();
         Cursor c = getMockContext().getContentResolver().query(Account.CONTENT_URI,
                 Account.CONTENT_PROJECTION, null, null, null);
         try {
             while (c.moveToNext()) {
-                accountList.add(new Account().restore(c));
+                Account account = new Account();
+                account.restore(c);
+                accountList.add(account);
             }
         } finally {
             c.close();

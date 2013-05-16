@@ -16,29 +16,34 @@
 
 package com.android.email.activity.setup;
 
-import com.android.email.R;
-import com.android.email.mail.Store;
-import com.android.email.provider.EmailContent;
-
+import android.content.Context;
 import android.content.Intent;
 import android.test.ActivityInstrumentationTestCase2;
 import android.test.suitebuilder.annotation.MediumTest;
+import android.view.View;
+import android.widget.CheckBox;
 import android.widget.Spinner;
 import android.widget.SpinnerAdapter;
 
+import com.android.email.R;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.HostAuth;
+
+import java.net.URISyntaxException;
+
 /**
  * Tests of basic UI logic in the AccountSetupOptions screen.
+ * You can run this entire test case with:
+ *   runtest -c com.android.email.activity.setup.AccountSetupOptionsTests email
  */
 @MediumTest
-public class AccountSetupOptionsTests 
+public class AccountSetupOptionsTests
         extends ActivityInstrumentationTestCase2<AccountSetupOptions> {
-
-    // borrowed from AccountSetupOptions
-    private static final String EXTRA_ACCOUNT = "account";
 
     private AccountSetupOptions mActivity;
     private Spinner mCheckFrequencyView;
-    
+    private CheckBox mBackgroundAttachmentsView;
+
     public AccountSetupOptionsTests() {
         super(AccountSetupOptions.class);
     }
@@ -46,56 +51,99 @@ public class AccountSetupOptionsTests
     /**
      * Test that POP accounts aren't displayed with a push option
      */
-    public void testPushOptionPOP() {
+    public void testPushOptionPOP() 
+            throws URISyntaxException {
         Intent i = getTestIntent("Name", "pop3://user:password@server.com");
         this.setActivityIntent(i);
-        
+
         getActivityAndFields();
-        
-        boolean hasPush = frequencySpinnerHasValue(EmailContent.Account.CHECK_INTERVAL_PUSH);
+
+        boolean hasPush = frequencySpinnerHasValue(Account.CHECK_INTERVAL_PUSH);
         assertFalse(hasPush);
     }
-        
+
     /**
      * Test that IMAP accounts aren't displayed with a push option
      */
-    public void testPushOptionIMAP() {
+    public void testPushOptionIMAP()
+            throws URISyntaxException {
         Intent i = getTestIntent("Name", "imap://user:password@server.com");
         this.setActivityIntent(i);
-        
+
         getActivityAndFields();
-        
-        boolean hasPush = frequencySpinnerHasValue(EmailContent.Account.CHECK_INTERVAL_PUSH);
+
+        boolean hasPush = frequencySpinnerHasValue(Account.CHECK_INTERVAL_PUSH);
         assertFalse(hasPush);
     }
-        
+
     /**
      * Test that EAS accounts are displayed with a push option
      */
-    public void testPushOptionEAS() {
-        // This test should only be run if EAS is supported
-        if (Store.StoreInfo.getStoreInfo("eas", this.getInstrumentation().getTargetContext()) 
-                == null) {
-            return;
-        }
-            
+    public void testPushOptionEAS()
+            throws URISyntaxException {
         Intent i = getTestIntent("Name", "eas://user:password@server.com");
         this.setActivityIntent(i);
-        
+
         getActivityAndFields();
-        
-        boolean hasPush = frequencySpinnerHasValue(EmailContent.Account.CHECK_INTERVAL_PUSH);
+
+        boolean hasPush = frequencySpinnerHasValue(Account.CHECK_INTERVAL_PUSH);
         assertTrue(hasPush);
     }
-        
+
+    /**
+     * Test that POP3 accounts don't have a "background attachments" checkbox
+     */
+    public void testBackgroundAttachmentsPop()
+            throws URISyntaxException {
+        checkBackgroundAttachments("pop3://user:password@server.com", false);
+    }
+
+    /**
+     * Test that IMAP accounts have a "background attachments" checkbox
+     */
+    public void testBackgroundAttachmentsImap()
+            throws URISyntaxException {
+        checkBackgroundAttachments("imap://user:password@server.com", true);
+    }
+
+    /**
+     * Test that EAS accounts have a "background attachments" checkbox
+     */
+    public void testBackgroundAttachmentsEas()
+            throws URISyntaxException {
+        checkBackgroundAttachments("eas://user:password@server.com", true);
+    }
+
+    /**
+     * Common code to check that the "background attachments" checkbox is shown/hidden properly
+     */
+    private void checkBackgroundAttachments(String storeUri, boolean expectVisible)
+            throws URISyntaxException {
+        Intent i = getTestIntent("Name", storeUri);
+        this.setActivityIntent(i);
+        getActivityAndFields();
+
+        boolean isNull = mBackgroundAttachmentsView == null;
+        boolean isVisible = !isNull && (mBackgroundAttachmentsView.getVisibility() == View.VISIBLE);
+
+        if (!expectVisible) {
+            assertTrue(!isVisible);
+        } else {
+            assertTrue(!isNull);
+            assertTrue(isVisible);
+        }
+    }
+
     /**
      * Get the activity (which causes it to be started, using our intent) and get the UI fields
      */
     private void getActivityAndFields() {
         mActivity = getActivity();
         mCheckFrequencyView = (Spinner) mActivity.findViewById(R.id.account_check_frequency);
+        mBackgroundAttachmentsView = (CheckBox) mActivity.findViewById(
+                R.id.account_background_attachments);
     }
-    
+
     /**
      * Test the frequency values list for a particular value
      */
@@ -110,17 +158,19 @@ public class AccountSetupOptionsTests
         }
         return false;
     }
-    
+
     /**
      * Create an intent with the Account in it
      */
-    private Intent getTestIntent(String name, String storeUri) {
-        EmailContent.Account account = new EmailContent.Account();
+    private Intent getTestIntent(String name, String storeUri)
+            throws URISyntaxException {
+        Account account = new Account();
         account.setSenderName(name);
-        account.setStoreUri(getInstrumentation().getTargetContext(), storeUri);
-        Intent i = new Intent(Intent.ACTION_MAIN);
-        i.putExtra(EXTRA_ACCOUNT, account);
-        return i;
+        Context context = getInstrumentation().getTargetContext();
+        HostAuth auth = account.getOrCreateHostAuthRecv(context);
+        HostAuth.setHostAuthFromString(auth, storeUri);
+        SetupData.init(SetupData.FLOW_MODE_NORMAL, account);
+        return new Intent(Intent.ACTION_MAIN);
     }
-    
+
 }

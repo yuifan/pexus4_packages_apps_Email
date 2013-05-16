@@ -16,29 +16,35 @@
 
 package com.android.email.mail.store;
 
+import android.content.Context;
+import android.os.Bundle;
+import android.util.Log;
+
+import com.android.email.Controller;
 import com.android.email.Email;
-import com.android.email.Utility;
-import com.android.email.mail.AuthenticationFailedException;
-import com.android.email.mail.FetchProfile;
-import com.android.email.mail.Flag;
-import com.android.email.mail.Folder;
-import com.android.email.mail.Message;
-import com.android.email.mail.MessagingException;
 import com.android.email.mail.Store;
 import com.android.email.mail.Transport;
-import com.android.email.mail.Folder.OpenMode;
-import com.android.email.mail.internet.MimeMessage;
-import com.android.email.mail.transport.LoggingInputStream;
 import com.android.email.mail.transport.MailTransport;
-
-import android.content.Context;
-import android.util.Config;
-import android.util.Log;
+import com.android.emailcommon.Logging;
+import com.android.emailcommon.internet.MimeMessage;
+import com.android.emailcommon.mail.AuthenticationFailedException;
+import com.android.emailcommon.mail.FetchProfile;
+import com.android.emailcommon.mail.Flag;
+import com.android.emailcommon.mail.Folder;
+import com.android.emailcommon.mail.Folder.OpenMode;
+import com.android.emailcommon.mail.Message;
+import com.android.emailcommon.mail.MessagingException;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.HostAuth;
+import com.android.emailcommon.provider.Mailbox;
+import com.android.emailcommon.service.EmailServiceProxy;
+import com.android.emailcommon.service.SearchParams;
+import com.android.emailcommon.utility.LoggingInputStream;
+import com.android.emailcommon.utility.Utility;
+import com.google.common.annotations.VisibleForTesting;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -50,15 +56,13 @@ public class Pop3Store extends Store {
     private static boolean DEBUG_LOG_RAW_STREAM = false;
 
     private static final Flag[] PERMANENT_FLAGS = { Flag.DELETED };
-
-    private Transport mTransport;
-    private String mUsername;
-    private String mPassword;
+    /** The name of the only mailbox available to POP3 accounts */
+    private static final String POP3_MAILBOX_NAME = "INBOX";
     private final HashMap<String, Folder> mFolders = new HashMap<String, Folder>();
 
 //    /**
 //     * Detected latency, used for usage scaling.
-//     * Usage scaling occurs when it is neccesary to get information about
+//     * Usage scaling occurs when it is necessary to get information about
 //     * messages that could result in large data loads. This value allows
 //     * the code that loads this data to decide between using large downloads
 //     * (high latency) or multiple round trips (low latency) to accomplish
@@ -70,7 +74,7 @@ public class Pop3Store extends Store {
 //
 //    /**
 //     * Detected throughput, used for usage scaling.
-//     * Usage scaling occurs when it is neccesary to get information about
+//     * Usage scaling occurs when it is necessary to get information about
 //     * messages that could result in large data loads. This value allows
 //     * the code that loads this data to decide between using large downloads
 //     * (high latency) or multiple round trips (low latency) to accomplish
@@ -84,54 +88,47 @@ public class Pop3Store extends Store {
     /**
      * Static named constructor.
      */
-    public static Store newInstance(String uri, Context context, PersistentDataCallbacks callbacks)
-            throws MessagingException {
-        return new Pop3Store(uri);
+    public static Store newInstance(Account account, Context context) throws MessagingException {
+        return new Pop3Store(context, account);
     }
 
     /**
-     * pop3://user:password@server:port
-     * pop3+tls+://user:password@server:port
-     * pop3+tls+trustallcerts://user:password@server:port
-     * pop3+ssl+://user:password@server:port
-     * pop3+ssl+trustallcerts://user:password@server:port
-     *
-     * @param _uri
+     * Creates a new store for the given account.
      */
-    private Pop3Store(String _uri) throws MessagingException {
-        URI uri;
-        try {
-            uri = new URI(_uri);
-        } catch (URISyntaxException use) {
-            throw new MessagingException("Invalid Pop3Store URI", use);
-        }
+    private Pop3Store(Context context, Account account) throws MessagingException {
+        mContext = context;
+        mAccount = account;
 
-        String scheme = uri.getScheme();
-        if (scheme == null || !scheme.startsWith(STORE_SCHEME_POP3)) {
+        HostAuth recvAuth = account.getOrCreateHostAuthRecv(context);
+        if (recvAuth == null || !HostAuth.SCHEME_POP3.equalsIgnoreCase(recvAuth.mProtocol)) {
             throw new MessagingException("Unsupported protocol");
         }
         // defaults, which can be changed by security modifiers
         int connectionSecurity = Transport.CONNECTION_SECURITY_NONE;
         int defaultPort = 110;
-        // check for security modifiers and apply changes
-        if (scheme.contains("+ssl")) {
+
+        // check for security flags and apply changes
+        if ((recvAuth.mFlags & HostAuth.FLAG_SSL) != 0) {
             connectionSecurity = Transport.CONNECTION_SECURITY_SSL;
             defaultPort = 995;
-        } else if (scheme.contains("+tls")) {
+        } else if ((recvAuth.mFlags & HostAuth.FLAG_TLS) != 0) {
             connectionSecurity = Transport.CONNECTION_SECURITY_TLS;
         }
-        boolean trustCertificates = scheme.contains(STORE_SECURITY_TRUST_CERTIFICATES);
+        boolean trustCertificates = ((recvAuth.mFlags & HostAuth.FLAG_TRUST_ALL) != 0);
 
+        int port = defaultPort;
+        if (recvAuth.mPort != HostAuth.PORT_UNKNOWN) {
+            port = recvAuth.mPort;
+        }
         mTransport = new MailTransport("POP3");
-        mTransport.setUri(uri, defaultPort);
+        mTransport.setHost(recvAuth.mAddress);
+        mTransport.setPort(port);
         mTransport.setSecurity(connectionSecurity, trustCertificates);
 
-        String[] userInfoParts = mTransport.getUserInfoParts();
+        String[] userInfoParts = recvAuth.getLogin();
         if (userInfoParts != null) {
             mUsername = userInfoParts[0];
-            if (userInfoParts.length > 1) {
-                mPassword = userInfoParts[1];
-            }
+            mPassword = userInfoParts[1];
         }
     }
 
@@ -145,7 +142,7 @@ public class Pop3Store extends Store {
     }
 
     @Override
-    public Folder getFolder(String name) throws MessagingException {
+    public Folder getFolder(String name) {
         Folder folder = mFolders.get(name);
         if (folder == null) {
             folder = new Pop3Folder(name);
@@ -154,11 +151,34 @@ public class Pop3Store extends Store {
         return folder;
     }
 
+    private final int[] DEFAULT_FOLDERS = {
+            Mailbox.TYPE_DRAFTS,
+            Mailbox.TYPE_OUTBOX,
+            Mailbox.TYPE_SENT,
+            Mailbox.TYPE_TRASH
+    };
+
     @Override
-    public Folder[] getPersonalNamespaces() throws MessagingException {
-        return new Folder[] {
-            getFolder("INBOX"),
-        };
+    public Folder[] updateFolders() {
+        Mailbox mailbox = Mailbox.getMailboxForPath(mContext, mAccount.mId, POP3_MAILBOX_NAME);
+        updateMailbox(mailbox, mAccount.mId, POP3_MAILBOX_NAME, '\0', true, Mailbox.TYPE_INBOX);
+        // Force the parent key to be "no mailbox" for the mail POP3 mailbox
+        mailbox.mParentKey = Mailbox.NO_MAILBOX;
+        if (mailbox.isSaved()) {
+            mailbox.update(mContext, mailbox.toContentValues());
+        } else {
+            mailbox.save(mContext);
+        }
+
+        // Build default mailboxes as well, in case they're not already made.
+        for (int type : DEFAULT_FOLDERS) {
+            if (Mailbox.findMailboxOfType(mContext, mAccount.mId, type) == Mailbox.NO_MAILBOX) {
+                String name = Controller.getMailboxServerName(mContext, type);
+                Mailbox.newSystemMailbox(mAccount.mId, type, name).save(mContext);
+            }
+        }
+
+        return new Folder[] { getFolder(POP3_MAILBOX_NAME) };
     }
 
     /**
@@ -169,18 +189,20 @@ public class Pop3Store extends Store {
      * @throws MessagingException if there was some problem with the account
      */
     @Override
-    public void checkSettings() throws MessagingException {
-        Pop3Folder folder = new Pop3Folder("INBOX");
+    public Bundle checkSettings() throws MessagingException {
+        Pop3Folder folder = new Pop3Folder(POP3_MAILBOX_NAME);
+        Bundle bundle = null;
         // Close any open or half-open connections - checkSettings should always be "fresh"
         if (mTransport.isOpen()) {
             folder.close(false);
         }
         try {
-            folder.open(OpenMode.READ_WRITE, null);
-            folder.checkSettings();
+            folder.open(OpenMode.READ_WRITE);
+            bundle = folder.checkSettings();
         } finally {
             folder.close(false);    // false == don't expunge anything
         }
+        return bundle;
     }
 
     class Pop3Folder extends Folder {
@@ -194,8 +216,8 @@ public class Pop3Store extends Store {
         private Pop3Capabilities mCapabilities;
 
         public Pop3Folder(String name) {
-            if (name.equalsIgnoreCase("INBOX")) {
-                mName = "INBOX";
+            if (name.equalsIgnoreCase(POP3_MAILBOX_NAME)) {
+                mName = POP3_MAILBOX_NAME;
             } else {
                 mName = name;
             }
@@ -206,9 +228,12 @@ public class Pop3Store extends Store {
          * an additional test to see if UIDL is supported on the server. If it's not we
          * can't service this account.
          *
+         * @return Bundle containing validation data (code and, if appropriate, error message)
          * @throws MessagingException if the account is not going to be useable
          */
-        public void checkSettings() throws MessagingException {
+        public Bundle checkSettings() throws MessagingException {
+            Bundle bundle = new Bundle();
+            int result = MessagingException.NO_ERROR;
             if (!mCapabilities.uidl) {
                 try {
                     UidlParser parser = new UidlParser();
@@ -223,19 +248,22 @@ public class Pop3Store extends Store {
                     }
                 } catch (IOException ioe) {
                     mTransport.close();
-                    throw new MessagingException(null, ioe);
+                    result = MessagingException.IOERROR;
+                    bundle.putString(EmailServiceProxy.VALIDATE_BUNDLE_ERROR_MESSAGE,
+                            ioe.getMessage());
                 }
             }
+            bundle.putInt(EmailServiceProxy.VALIDATE_BUNDLE_RESULT_CODE, result);
+            return bundle;
         }
 
         @Override
-        public synchronized void open(OpenMode mode, PersistentDataCallbacks callbacks)
-                throws MessagingException {
+        public synchronized void open(OpenMode mode) throws MessagingException {
             if (mTransport.isOpen()) {
                 return;
             }
 
-            if (!mName.equalsIgnoreCase("INBOX")) {
+            if (!mName.equalsIgnoreCase(POP3_MAILBOX_NAME)) {
                 throw new MessagingException("Folder does not exist");
             }
 
@@ -252,8 +280,8 @@ public class Pop3Store extends Store {
                         executeSimpleCommand("STLS");
                         mTransport.reopenTls();
                     } else {
-                        if (Config.LOGD && Email.DEBUG) {
-                            Log.d(Email.LOG_TAG, "TLS not supported but required");
+                        if (Email.DEBUG) {
+                            Log.d(Logging.LOG_TAG, "TLS not supported but required");
                         }
                         throw new MessagingException(MessagingException.TLS_REQUIRED);
                     }
@@ -263,15 +291,15 @@ public class Pop3Store extends Store {
                     executeSensitiveCommand("USER " + mUsername, "USER /redacted/");
                     executeSensitiveCommand("PASS " + mPassword, "PASS /redacted/");
                 } catch (MessagingException me) {
-                    if (Config.LOGD && Email.DEBUG) {
-                        Log.d(Email.LOG_TAG, me.toString());
+                    if (Email.DEBUG) {
+                        Log.d(Logging.LOG_TAG, me.toString());
                     }
                     throw new AuthenticationFailedException(null, me);
                 }
             } catch (IOException ioe) {
                 mTransport.close();
-                if (Config.LOGD && Email.DEBUG) {
-                    Log.d(Email.LOG_TAG, ioe.toString());
+                if (Email.DEBUG) {
+                    Log.d(Logging.LOG_TAG, ioe.toString());
                 }
                 throw new MessagingException(MessagingException.IOERROR, ioe.toString());
             }
@@ -292,8 +320,8 @@ public class Pop3Store extends Store {
             }
             if (statException != null) {
                 mTransport.close();
-                if (Config.LOGD && Email.DEBUG) {
-                    Log.d(Email.LOG_TAG, statException.toString());
+                if (Email.DEBUG) {
+                    Log.d(Logging.LOG_TAG, statException.toString());
                 }
                 throw new MessagingException("POP3 STAT", statException);
             }
@@ -303,7 +331,7 @@ public class Pop3Store extends Store {
         }
 
         @Override
-        public OpenMode getMode() throws MessagingException {
+        public OpenMode getMode() {
             return OpenMode.READ_WRITE;
         }
 
@@ -337,13 +365,13 @@ public class Pop3Store extends Store {
         }
 
         @Override
-        public boolean create(FolderType type) throws MessagingException {
+        public boolean create(FolderType type) {
             return false;
         }
 
         @Override
-        public boolean exists() throws MessagingException {
-            return mName.equalsIgnoreCase("INBOX");
+        public boolean exists() {
+            return mName.equalsIgnoreCase(POP3_MAILBOX_NAME);
         }
 
         @Override
@@ -352,7 +380,7 @@ public class Pop3Store extends Store {
         }
 
         @Override
-        public int getUnreadMessageCount() throws MessagingException {
+        public int getUnreadMessageCount() {
             return -1;
         }
 
@@ -364,7 +392,7 @@ public class Pop3Store extends Store {
                 } catch (IOException ioe) {
                     mTransport.close();
                     if (Email.DEBUG) {
-                        Log.d(Email.LOG_TAG, "Unable to index during getMessage " + ioe);
+                        Log.d(Logging.LOG_TAG, "Unable to index during getMessage " + ioe);
                     }
                     throw new MessagingException("getMessages", ioe);
                 }
@@ -384,8 +412,8 @@ public class Pop3Store extends Store {
                 indexMsgNums(start, end);
             } catch (IOException ioe) {
                 mTransport.close();
-                if (Config.LOGD && Email.DEBUG) {
-                    Log.d(Email.LOG_TAG, ioe.toString());
+                if (Email.DEBUG) {
+                    Log.d(Logging.LOG_TAG, ioe.toString());
                 }
                 throw new MessagingException("getMessages", ioe);
             }
@@ -597,14 +625,9 @@ public class Pop3Store extends Store {
         }
 
         @Override
-        public Message[] getMessages(MessageRetrievalListener listener) throws MessagingException {
-            throw new UnsupportedOperationException("Pop3Folder.getMessage(MessageRetrievalListener)");
-        }
-
-        @Override
-        public Message[] getMessages(String[] uids, MessageRetrievalListener listener)
-                throws MessagingException {
-            throw new UnsupportedOperationException("Pop3Folder.getMessage(MessageRetrievalListener)");
+        public Message[] getMessages(String[] uids, MessageRetrievalListener listener) {
+            throw new UnsupportedOperationException(
+                    "Pop3Folder.getMessage(MessageRetrievalListener)");
         }
 
         /**
@@ -633,8 +656,8 @@ public class Pop3Store extends Store {
                 }
             } catch (IOException ioe) {
                 mTransport.close();
-                if (Config.LOGD && Email.DEBUG) {
-                    Log.d(Email.LOG_TAG, ioe.toString());
+                if (Email.DEBUG) {
+                    Log.d(Logging.LOG_TAG, ioe.toString());
                 }
                 throw new MessagingException("fetch", ioe);
             }
@@ -668,8 +691,8 @@ public class Pop3Store extends Store {
                     }
                 } catch (IOException ioe) {
                     mTransport.close();
-                    if (Config.LOGD && Email.DEBUG) {
-                        Log.d(Email.LOG_TAG, ioe.toString());
+                    if (Email.DEBUG) {
+                        Log.d(Logging.LOG_TAG, ioe.toString());
                     }
                     throw new MessagingException("Unable to fetch message", ioe);
                 }
@@ -695,7 +718,8 @@ public class Pop3Store extends Store {
                 for (int i = 0, count = messages.length; i < count; i++) {
                     Message message = messages[i];
                     if (!(message instanceof Pop3Message)) {
-                        throw new MessagingException("Pop3Store.fetch called with non-Pop3 Message");
+                        throw new MessagingException(
+                                "Pop3Store.fetch called with non-Pop3 Message");
                     }
                     Pop3Message pop3Message = (Pop3Message)message;
                     String response = executeSimpleCommand(String.format("LIST %d",
@@ -774,7 +798,7 @@ public class Pop3Store extends Store {
             if (response != null)  {
                 try {
                     InputStream in = mTransport.getInputStream();
-                    if (DEBUG_LOG_RAW_STREAM && Config.LOGD && Email.DEBUG) {
+                    if (DEBUG_LOG_RAW_STREAM && Email.DEBUG) {
                         in = new LoggingInputStream(in);
                     }
                     message.parse(new Pop3ResponseInputStream(in));
@@ -794,20 +818,20 @@ public class Pop3Store extends Store {
         }
 
         @Override
-        public Flag[] getPermanentFlags() throws MessagingException {
+        public Flag[] getPermanentFlags() {
             return PERMANENT_FLAGS;
         }
 
         @Override
-        public void appendMessages(Message[] messages) throws MessagingException {
+        public void appendMessages(Message[] messages) {
         }
 
         @Override
-        public void delete(boolean recurse) throws MessagingException {
+        public void delete(boolean recurse) {
         }
 
         @Override
-        public Message[] expunge() throws MessagingException {
+        public Message[] expunge() {
             return null;
         }
 
@@ -828,16 +852,15 @@ public class Pop3Store extends Store {
             }
             catch (IOException ioe) {
                 mTransport.close();
-                if (Config.LOGD && Email.DEBUG) {
-                    Log.d(Email.LOG_TAG, ioe.toString());
+                if (Email.DEBUG) {
+                    Log.d(Logging.LOG_TAG, ioe.toString());
                 }
                 throw new MessagingException("setFlags()", ioe);
             }
         }
 
         @Override
-        public void copyMessages(Message[] msgs, Folder folder, MessageUpdateCallbacks callbacks)
-                throws MessagingException {
+        public void copyMessages(Message[] msgs, Folder folder, MessageUpdateCallbacks callbacks) {
             throw new UnsupportedOperationException("copyMessages is not supported in POP3");
         }
 
@@ -848,7 +871,7 @@ public class Pop3Store extends Store {
 //                    (mMessageCount * 58) / (mThroughputKbS * 1024 / 8) * 1000;
 //        }
 
-        private Pop3Capabilities getCapabilities() throws IOException, MessagingException {
+        private Pop3Capabilities getCapabilities() throws IOException {
             Pop3Capabilities capabilities = new Pop3Capabilities();
             try {
                 String response = executeSimpleCommand("CAPA");
@@ -904,7 +927,7 @@ public class Pop3Store extends Store {
          */
         private String executeSensitiveCommand(String command, String sensitiveReplacement)
                 throws IOException, MessagingException {
-            open(OpenMode.READ_WRITE, null);
+            open(OpenMode.READ_WRITE);
 
             if (command != null) {
                 mTransport.writeLine(command, sensitiveReplacement);
@@ -928,19 +951,24 @@ public class Pop3Store extends Store {
         }
 
         @Override
-        // TODO this is deprecated, eventually discard
+        @VisibleForTesting
         public boolean isOpen() {
             return mTransport.isOpen();
         }
 
         @Override
-        public Message createMessage(String uid) throws MessagingException {
+        public Message createMessage(String uid) {
             return new Pop3Message(uid, this);
+        }
+
+        @Override
+        public Message[] getMessages(SearchParams params, MessageRetrievalListener listener) {
+            return null;
         }
     }
 
-    class Pop3Message extends MimeMessage {
-        public Pop3Message(String uid, Pop3Folder folder) throws MessagingException {
+    public static class Pop3Message extends MimeMessage {
+        public Pop3Message(String uid, Pop3Folder folder) {
             mUid = uid;
             mFolder = folder;
             mSize = -1;
@@ -951,7 +979,7 @@ public class Pop3Store extends Store {
         }
 
         @Override
-        protected void parse(InputStream in) throws IOException, MessagingException {
+        public void parse(InputStream in) throws IOException, MessagingException {
             super.parse(in);
         }
 

@@ -16,15 +16,18 @@
 
 package com.android.email;
 
+import com.android.emailcommon.mail.MessagingException;
+
 import android.content.Context;
 
+import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class GroupMessagingListener extends MessagingListener {
     /* The synchronization of the methods in this class
        is not needed because we use ConcurrentHashMap.
-       
+
        Nevertheless, let's keep the "synchronized" for a while in the case
        we may want to change the implementation to use something else
        than ConcurrentHashMap.
@@ -78,10 +81,10 @@ public class GroupMessagingListener extends MessagingListener {
 
     @Override
     synchronized public void synchronizeMailboxFinished(long accountId, long mailboxId,
-            int totalMessagesInMailbox, int numNewMessages) {
+            int totalMessagesInMailbox, int numNewMessages, ArrayList<Long> addedMessages) {
         for (MessagingListener l : mListeners) {
             l.synchronizeMailboxFinished(accountId, mailboxId,
-                    totalMessagesInMailbox, numNewMessages);
+                    totalMessagesInMailbox, numNewMessages, addedMessages);
         }
     }
 
@@ -184,9 +187,10 @@ public class GroupMessagingListener extends MessagingListener {
             long accountId,
             long messageId,
             long attachmentId,
-            String reason) {
+            MessagingException me,
+            boolean background) {
         for (MessagingListener l : mListeners) {
-            l.loadAttachmentFailed(accountId, messageId, attachmentId, reason);
+            l.loadAttachmentFailed(accountId, messageId, attachmentId, me, background);
         }
     }
 

@@ -16,32 +16,36 @@
 
 package com.android.email.activity.setup;
 
-import com.android.email.mail.Store;
-import com.android.email.provider.EmailContent;
-import com.android.email.provider.EmailContent.Account;
-
 import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.preference.ListPreference;
+import android.preference.PreferenceFragment;
 import android.test.ActivityInstrumentationTestCase2;
 import android.test.suitebuilder.annotation.MediumTest;
 
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.HostAuth;
+
+import java.net.URISyntaxException;
+
 /**
- * Tests of basic UI logic in the AccountSettings screen.
+ * Tests of basic UI logic in the Account Settings fragment.
+ *
+ * TODO: This should use a local provider for the test "accounts", and not touch user data
+ * TODO: These cannot run in the single-pane mode, and need to be refactored into single-pane
+ *       and multi-pane versions.  Until then, they are all disabled.
+ *
+ * To execute:  runtest -c com.android.email.activity.setup.AccountSettingsTests email
  */
 @MediumTest
 public class AccountSettingsTests extends ActivityInstrumentationTestCase2<AccountSettings> {
-
-    // Borrowed from AccountSettings
-    private static final String EXTRA_ACCOUNT_ID = "account_id";
 
     private long mAccountId;
     private Account mAccount;
 
     private Context mContext;
-    private AccountSettings mActivity;
     private ListPreference mCheckFrequency;
 
     private static final String PREFERENCE_FREQUENCY = "account_check_frequency";
@@ -57,7 +61,7 @@ public class AccountSettingsTests extends ActivityInstrumentationTestCase2<Accou
     protected void setUp() throws Exception {
         super.setUp();
 
-        mContext = this.getInstrumentation().getTargetContext();
+        mContext = getInstrumentation().getTargetContext();
     }
 
     /**
@@ -77,10 +81,10 @@ public class AccountSettingsTests extends ActivityInstrumentationTestCase2<Accou
     /**
      * Test that POP accounts aren't displayed with a push option
      */
-    public void testPushOptionPOP() {
+    public void disable_testPushOptionPOP() throws Throwable {
         Intent i = getTestIntent("Name", "pop3://user:password@server.com",
                 "smtp://user:password@server.com");
-        this.setActivityIntent(i);
+        setActivityIntent(i);
 
         getActivityAndFields();
 
@@ -91,10 +95,10 @@ public class AccountSettingsTests extends ActivityInstrumentationTestCase2<Accou
     /**
      * Test that IMAP accounts aren't displayed with a push option
      */
-    public void testPushOptionIMAP() {
+    public void disable_testPushOptionIMAP() throws Throwable {
         Intent i = getTestIntent("Name", "imap://user:password@server.com",
                 "smtp://user:password@server.com");
-        this.setActivityIntent(i);
+        setActivityIntent(i);
 
         getActivityAndFields();
 
@@ -105,16 +109,10 @@ public class AccountSettingsTests extends ActivityInstrumentationTestCase2<Accou
     /**
      * Test that EAS accounts are displayed with a push option
      */
-    public void testPushOptionEAS() {
-        // This test should only be run if EAS is supported
-        if (Store.StoreInfo.getStoreInfo("eas", this.getInstrumentation().getTargetContext())
-                == null) {
-            return;
-        }
-
+    public void disable_testPushOptionEAS() throws Throwable {
         Intent i = getTestIntent("Name", "eas://user:password@server.com",
                 "eas://user:password@server.com");
-        this.setActivityIntent(i);
+        setActivityIntent(i);
 
         getActivityAndFields();
 
@@ -125,9 +123,16 @@ public class AccountSettingsTests extends ActivityInstrumentationTestCase2<Accou
     /**
      * Get the activity (which causes it to be started, using our intent) and get the UI fields
      */
-    private void getActivityAndFields() {
-        mActivity = getActivity();
-        mCheckFrequency = (ListPreference) mActivity.findPreference(PREFERENCE_FREQUENCY);
+    private void getActivityAndFields() throws Throwable {
+        final AccountSettings theActivity = getActivity();
+
+        runTestOnUiThread(new Runnable() {
+            public void run() {
+                PreferenceFragment f = (PreferenceFragment) theActivity.mCurrentFragment;
+                mCheckFrequency =
+                    (ListPreference) f.findPreference(PREFERENCE_FREQUENCY);
+            }
+        });
     }
 
     /**
@@ -146,19 +151,18 @@ public class AccountSettingsTests extends ActivityInstrumentationTestCase2<Accou
     /**
      * Create an intent with the Account in it
      */
-    private Intent getTestIntent(String name, String storeUri, String senderUri) {
+    private Intent getTestIntent(String name, String storeUri, String senderUri)
+            throws URISyntaxException {
         mAccount = new Account();
         mAccount.setSenderName(name);
         // For EAS, at least, email address is required
         mAccount.mEmailAddress = "user@server.com";
-        mAccount.setStoreUri(mContext, storeUri);
-        mAccount.setSenderUri(mContext, senderUri);
+        HostAuth.setHostAuthFromString(mAccount.getOrCreateHostAuthRecv(mContext), storeUri);
+        HostAuth.setHostAuthFromString(mAccount.getOrCreateHostAuthSend(mContext), senderUri);
         mAccount.save(mContext);
         mAccountId = mAccount.mId;
 
-        Intent i = new Intent(Intent.ACTION_MAIN);
-        i.putExtra(EXTRA_ACCOUNT_ID, mAccountId);
-        return i;
+        return AccountSettings.createAccountSettingsIntent(mContext, mAccountId, null);
     }
 
 }

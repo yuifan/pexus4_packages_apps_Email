@@ -16,14 +16,6 @@
 
 package com.android.email.activity;
 
-import com.android.email.Email;
-import com.android.email.EmailAddressValidator;
-import com.android.email.R;
-import com.android.email.mail.Address;
-import com.android.email.mail.MessagingException;
-import com.android.email.provider.EmailContent.Account;
-import com.android.email.provider.EmailContent.Message;
-
 import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
@@ -31,9 +23,25 @@ import android.net.Uri;
 import android.test.ActivityInstrumentationTestCase2;
 import android.test.UiThreadTest;
 import android.test.suitebuilder.annotation.LargeTest;
+import android.test.suitebuilder.annotation.SmallTest;
+import android.util.Log;
 import android.view.View;
 import android.widget.EditText;
 import android.widget.MultiAutoCompleteTextView;
+
+import com.android.email.Email;
+import com.android.email.EmailAddressValidator;
+import com.android.email.R;
+import com.android.email.TestUtils;
+import com.android.emailcommon.Logging;
+import com.android.emailcommon.mail.Address;
+import com.android.emailcommon.mail.MessagingException;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.EmailContent.Attachment;
+import com.android.emailcommon.provider.EmailContent.Message;
+import com.google.android.collect.Lists;
+
+import java.util.ArrayList;
 
 
 /**
@@ -48,13 +56,17 @@ import android.widget.MultiAutoCompleteTextView;
 public class MessageComposeTests
         extends ActivityInstrumentationTestCase2<MessageCompose> {
 
+    private Context mContext;
+
     private MultiAutoCompleteTextView mToView;
     private MultiAutoCompleteTextView mCcView;
+    private MultiAutoCompleteTextView mBccView;
     private EditText mSubjectView;
     private EditText mMessageView;
     private long mCreatedAccountId = -1;
     private String mSignature;
 
+    private static final String ACCOUNT = "account@android.com";
     private static final String SENDER = "sender@android.com";
     private static final String REPLYTO = "replyto@android.com";
     private static final String RECIPIENT_TO = "recipient-to@android.com";
@@ -62,8 +74,6 @@ public class MessageComposeTests
     private static final String RECIPIENT_BCC = "recipient-bcc@android.com";
     private static final String SUBJECT = "This is the subject";
     private static final String BODY = "This is the body.  This is also the body.";
-    private static final String REPLY_BODY_SHORT = "\n\n" + SENDER + " wrote:\n\n";
-    private static final String REPLY_BODY = REPLY_BODY_SHORT + ">" + BODY;
     private static final String SIGNATURE = "signature";
 
     private static final String FROM = "Fred From <from@google.com>";
@@ -101,7 +111,12 @@ public class MessageComposeTests
     private static final String UTF32_SUBJECT = "\uD834\uDF01\uD834\uDF46";
     private static final String UTF32_BODY = "\uD834\uDF01\uD834\uDF46";
 
-    /** Note - these are copied from private strings in MessageCompose.  Make them package? */
+    /*
+     * The following action definitions are purposefully copied from MessageCompose, so that
+     * any changes to the action strings will break these tests. Changes to the actions should
+     * be done consciously to think about existing shortcuts and clients.
+     */
+
     private static final String ACTION_REPLY = "com.android.email.intent.action.REPLY";
     private static final String ACTION_REPLY_ALL = "com.android.email.intent.action.REPLY_ALL";
     private static final String ACTION_FORWARD = "com.android.email.intent.action.FORWARD";
@@ -119,27 +134,29 @@ public class MessageComposeTests
     @Override
     protected void setUp() throws Exception {
         super.setUp();
-        Context context = getInstrumentation().getTargetContext();
+        mContext = getInstrumentation().getTargetContext();
 
         // Force assignment of a default account
-        long accountId = Account.getDefaultAccountId(context);
+        long accountId = Account.getDefaultAccountId(mContext);
         if (accountId == -1) {
             Account account = new Account();
             account.mSenderName = "Bob Sender";
             account.mEmailAddress = "bob@sender.com";
-            account.save(context);
+            account.mSignature = SIGNATURE;
+            account.save(mContext);
             accountId = account.mId;
             mCreatedAccountId = accountId;
         }
-        Account account = Account.restoreAccountWithId(context, accountId);
+        Account account = Account.restoreAccountWithId(mContext, accountId);
         mSignature = account.getSignature();
-        Email.setServicesEnabled(context);
+        Email.setServicesEnabledSync(mContext);
 
         Intent intent = new Intent(Intent.ACTION_VIEW);
         setActivityIntent(intent);
         final MessageCompose a = getActivity();
         mToView = (MultiAutoCompleteTextView) a.findViewById(R.id.to);
         mCcView = (MultiAutoCompleteTextView) a.findViewById(R.id.cc);
+        mBccView = (MultiAutoCompleteTextView) a.findViewById(R.id.bcc);
         mSubjectView = (EditText) a.findViewById(R.id.subject);
         mMessageView = (EditText) a.findViewById(R.id.message_content);
     }
@@ -167,13 +184,16 @@ public class MessageComposeTests
         assertNotNull(mSubjectView);
         assertEquals(0, mSubjectView.length());
         assertNotNull(mMessageView);
-        assertEquals(0, mMessageView.length());
+
+        // Note that the signature is always preceeded with a newline.
+        int sigLength = (mSignature == null) ? 0 : (1 + mSignature.length());
+        assertEquals(sigLength, mMessageView.length());
     }
 
      /**
-     * Test a couple of variations of processSourceMessage() for REPLY
+     * Test a couple of variations of processSourceMessage() for REPLY.
      *   To = Reply-To or From:  (if REPLY)
-     *   To = (Reply-To or From:) + To: + Cc:   (if REPLY_ALL)
+     *   To = (Reply-To or From:), Cc = + To: + Cc:   (if REPLY_ALL)
      *   Subject = Re: Subject
      *   Body = empty  (and has cursor)
      *
@@ -184,10 +204,13 @@ public class MessageComposeTests
         Intent intent = new Intent(ACTION_REPLY);
         final MessageCompose a = getActivity();
         a.setIntent(intent);
+        final Account account = new Account();
+        account.mEmailAddress = ACCOUNT;
 
         runTestOnUiThread(new Runnable() {
             public void run() {
-                a.processSourceMessage(message, null);
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
                 checkFields(SENDER + ", ", null, null, "Re: " + SUBJECT, null, null);
                 checkFocused(mMessageView);
             }
@@ -199,8 +222,65 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 resetViews();
-                a.processSourceMessage(message, null);
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
                 checkFields(REPLYTO + ", ", null, null, "Re: " + SUBJECT, null, null);
+                checkFocused(mMessageView);
+            }
+        });
+    }
+
+    /**
+     * Tests similar cases as testProcessSourceMessageReply, but when sender is in From: (or
+     * Reply-to: if applicable) field.
+     *
+     * To = To (if REPLY)
+     * To = To, Cc = Cc (if REPLY_ALL)
+     * Subject = Re: Subject
+     * Body = empty  (and has cursor)
+     *
+     * @throws MessagingException
+     * @throws Throwable
+     */
+    public void testRepliesWithREplyToFields() throws MessagingException, Throwable {
+        final Message message = buildTestMessage(RECIPIENT_TO, SENDER, SUBJECT, BODY);
+        message.mCc = RECIPIENT_CC;
+        Intent intent = new Intent(ACTION_REPLY);
+        final MessageCompose a = getActivity();
+        a.setIntent(intent);
+        final Account account = new Account();
+        account.mEmailAddress = SENDER;
+
+        runTestOnUiThread(new Runnable() {
+            public void run() {
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
+                checkFields(RECIPIENT_TO + ", ", null, null, "Re: " + SUBJECT, null, null);
+                checkFocused(mMessageView);
+            }
+        });
+
+        message.mFrom = null;
+        message.mReplyTo = Address.parseAndPack(SENDER);
+
+        runTestOnUiThread(new Runnable() {
+            public void run() {
+                resetViews();
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
+                checkFields(RECIPIENT_TO + ", ", null, null, "Re: " + SUBJECT, null, null);
+                checkFocused(mMessageView);
+            }
+        });
+
+        a.setIntent(new Intent(ACTION_REPLY_ALL));
+        runTestOnUiThread(new Runnable() {
+            public void run() {
+                resetViews();
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
+                checkFields(RECIPIENT_TO + ", ", RECIPIENT_CC + ", ", null,
+                        "Re: " + SUBJECT, null, null);
                 checkFocused(mMessageView);
             }
         });
@@ -212,10 +292,12 @@ public class MessageComposeTests
         final MessageCompose a = getActivity();
         a.setIntent(intent);
         final Account account = new Account();
+        account.mEmailAddress = ACCOUNT;
         account.mSignature = SIGNATURE;
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, SIGNATURE);
                 checkFields(SENDER + ", ", null, null, "Re: " + SUBJECT, null, SIGNATURE);
                 checkFocused(mMessageView);
             }
@@ -228,6 +310,7 @@ public class MessageComposeTests
             public void run() {
                 resetViews();
                 a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, SIGNATURE);
                 checkFields(REPLYTO + ", ", null, null, "Re: " + SUBJECT, null, SIGNATURE);
                 checkFocused(mMessageView);
             }
@@ -245,6 +328,7 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, SIGNATURE);
                 checkFields(null, null, null, "Fwd: " + SUBJECT, null, SIGNATURE);
                 checkFocused(mToView);
            }
@@ -260,10 +344,13 @@ public class MessageComposeTests
         Intent intent = new Intent(ACTION_REPLY);
         final MessageCompose a = getActivity();
         a.setIntent(intent);
+        final Account account = new Account();
+        account.mEmailAddress = ACCOUNT;
 
         runTestOnUiThread(new Runnable() {
             public void run() {
-                a.processSourceMessage(message, null);
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
                 checkFields(UTF16_SENDER + ", ", null, null, "Re: " + UTF16_SUBJECT, null, null);
                 checkFocused(mMessageView);
             }
@@ -275,7 +362,8 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 resetViews();
-                a.processSourceMessage(message, null);
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
                 checkFields(UTF16_REPLYTO + ", ", null, null, "Re: " + UTF16_SUBJECT, null, null);
                 checkFocused(mMessageView);
             }
@@ -291,10 +379,13 @@ public class MessageComposeTests
         Intent intent = new Intent(ACTION_REPLY);
         final MessageCompose a = getActivity();
         a.setIntent(intent);
+        final Account account = new Account();
+        account.mEmailAddress = ACCOUNT;
 
         runTestOnUiThread(new Runnable() {
             public void run() {
-                a.processSourceMessage(message, null);
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
                 checkFields(UTF32_SENDER + ", ", null, null, "Re: " + UTF32_SUBJECT, null, null);
                 checkFocused(mMessageView);
             }
@@ -306,7 +397,8 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 resetViews();
-                a.processSourceMessage(message, null);
+                a.processSourceMessage(message, account);
+                a.setInitialComposeText(null, null);
                 checkFields(UTF32_REPLYTO + ", ", null, null, "Re: " + UTF32_SUBJECT, null, null);
                 checkFocused(mMessageView);
             }
@@ -328,6 +420,7 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.processSourceMessage(message, null);
+                a.setInitialComposeText(null, null);
                 checkFields(null, null, null, "Fwd: " + SUBJECT, null, null);
                 checkFocused(mToView);
             }
@@ -343,7 +436,7 @@ public class MessageComposeTests
      *
      * TODO check CC and BCC handling too
      */
-    public void testProcessSourceMessageDraft() throws MessagingException, Throwable {
+    public void testProcessDraftMessage() throws MessagingException, Throwable {
 
         final Message message = buildTestMessage(RECIPIENT_TO, SENDER, SUBJECT, BODY);
         Intent intent = new Intent(ACTION_EDIT_DRAFT);
@@ -352,7 +445,7 @@ public class MessageComposeTests
 
         runTestOnUiThread(new Runnable() {
             public void run() {
-                a.processSourceMessage(message, null);
+                a.processDraftMessage(message, true);
                 checkFields(RECIPIENT_TO + ", ", null, null, SUBJECT, BODY, null);
                 checkFocused(mMessageView);
             }
@@ -365,7 +458,7 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 resetViews();
-                a.processSourceMessage(message, null);
+                a.processDraftMessage(message, true);
                 checkFields(RECIPIENT_TO + ", ", null, null, null, BODY, null);
                 checkFocused(mSubjectView);
             }
@@ -374,10 +467,10 @@ public class MessageComposeTests
     }
 
     /**
-     * Test processSourceMessage() for EDIT_DRAFT with utf-16 name and address
+     * Test processDraftMessage() for EDIT_DRAFT with utf-16 name and address
      * TODO check CC and BCC handling too
      */
-    public void testProcessSourceMessageDraftWithUtf16() throws MessagingException, Throwable {
+    public void testProcessDraftMessageWithUtf16() throws MessagingException, Throwable {
 
         final Message message = buildTestMessage(UTF16_RECIPIENT_TO, UTF16_SENDER,
                 UTF16_SUBJECT, UTF16_BODY);
@@ -387,7 +480,7 @@ public class MessageComposeTests
 
         runTestOnUiThread(new Runnable() {
             public void run() {
-                a.processSourceMessage(message, null);
+                a.processDraftMessage(message, true);
                 checkFields(UTF16_RECIPIENT_TO + ", ",
                         null, null, UTF16_SUBJECT, UTF16_BODY, null);
                 checkFocused(mMessageView);
@@ -401,7 +494,7 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 resetViews();
-                a.processSourceMessage(message, null);
+                a.processDraftMessage(message, true);
                 checkFields(UTF16_RECIPIENT_TO + ", ", null, null, null, UTF16_BODY, null);
                 checkFocused(mSubjectView);
             }
@@ -410,10 +503,10 @@ public class MessageComposeTests
     }
 
     /**
-     * Test processSourceMessage() for EDIT_DRAFT with utf-32 name and address
+     * Test processDraftMessage() for EDIT_DRAFT with utf-32 name and address
      * TODO check CC and BCC handling too
      */
-    public void testProcessSourceMessageDraftWithUtf32() throws MessagingException, Throwable {
+    public void testProcessDraftMessageWithUtf32() throws MessagingException, Throwable {
 
         final Message message = buildTestMessage(UTF32_RECIPIENT_TO, UTF32_SENDER,
                 UTF32_SUBJECT, UTF32_BODY);
@@ -423,7 +516,7 @@ public class MessageComposeTests
 
         runTestOnUiThread(new Runnable() {
             public void run() {
-                a.processSourceMessage(message, null);
+                a.processDraftMessage(message, true);
                 checkFields(UTF32_RECIPIENT_TO + ", ",
                         null, null, UTF32_SUBJECT, UTF32_BODY, null);
                 checkFocused(mMessageView);
@@ -437,7 +530,7 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 resetViews();
-                a.processSourceMessage(message, null);
+                a.processDraftMessage(message, true);
                 checkFields(UTF32_RECIPIENT_TO + ", ", null, null, null, UTF32_BODY, null);
                 checkFocused(mSubjectView);
             }
@@ -470,11 +563,13 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(intent);
-                a.setupAddressViews(message, account, mToView, mCcView, false);
+                a.setupAddressViews(message, account, false);
                 assertEquals("", mCcView.getText().toString());
                 String result = Address.parseAndPack(mToView.getText().toString());
                 String expected = Address.parseAndPack(FROM);
                 assertEquals(expected, result);
+
+                // It doesn't harm even if the CC view is visible.
             }
         });
     }
@@ -485,8 +580,8 @@ public class MessageComposeTests
      *
      * In this case, we're doing a "reply all"
      * The user is TO1 (a "to" recipient)
-     * The to should be: FROM and TO2
-     * The cc should be: CC1, CC2, and CC3
+     * The to should be: FROM
+     * The cc should be: TO2, CC1, CC2, and CC3
      */
     public void testReplyAllAddresses1() throws Throwable {
         final MessageCompose a = getActivity();
@@ -504,13 +599,14 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(intent);
-                a.setupAddressViews(message, account, mToView, mCcView, true);
+                a.setupAddressViews(message, account, true);
                 String result = Address.parseAndPack(mToView.getText().toString());
-                String expected = Address.parseAndPack(FROM + ',' + TO2);
+                String expected = Address.parseAndPack(FROM);
                 assertEquals(expected, result);
                 result = Address.parseAndPack(mCcView.getText().toString());
-                expected = Address.parseAndPack(CC1 + ',' + CC2 + ',' + CC3);
+                expected = Address.parseAndPack(TO2 + ',' + CC1 + ',' + CC2 + ',' + CC3);
                 assertEquals(expected, result);
+                TestUtils.assertViewVisible(mCcView);
             }
         });
     }
@@ -521,8 +617,8 @@ public class MessageComposeTests
      *
      * In this case, we're doing a "reply all"
      * The user is CC2 (a "cc" recipient)
-     * The to should be: FROM, TO1, and TO2
-     * The cc should be: CC1 and CC3 (CC2 is our account's email address)
+     * The to should be: FROM,
+     * The cc should be: TO1, TO2, CC1 and CC3 (CC2 is our account's email address)
      */
     public void testReplyAllAddresses2() throws Throwable {
         final MessageCompose a = getActivity();
@@ -540,13 +636,14 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(intent);
-                a.setupAddressViews(message, account, mToView, mCcView, true);
+                a.setupAddressViews(message, account, true);
                 String result = Address.parseAndPack(mToView.getText().toString());
-                String expected = Address.parseAndPack(FROM + ',' + TO1 + ',' + TO2);
+                String expected = Address.parseAndPack(FROM);
                 assertEquals(expected, result);
                 result = Address.parseAndPack(mCcView.getText().toString());
-                expected = Address.parseAndPack(CC1 + ',' + CC3);
+                expected = Address.parseAndPack(TO1 + ',' + TO2 + ',' + CC1 + ',' + CC3);
                 assertEquals(expected, result);
+                TestUtils.assertViewVisible(mCcView);
             }
         });
     }
@@ -557,8 +654,9 @@ public class MessageComposeTests
      *
      * In this case, we're doing a "reply all"
      * The user is CC2 (a "cc" recipient)
-     * The to should be: FROM, TO1, TO2, and TO3
-     * The cc should be: CC3 (CC1/CC4 are duplicates; CC2 is the our account's email address)
+     * The to should be: FROM
+     * The cc should be: TO1, TO2, ,TO3, and CC3 (CC1/CC4 are duplicates; CC2 is the our
+     * account's email address)
      */
     public void testReplyAllAddresses3() throws Throwable {
         final MessageCompose a = getActivity();
@@ -576,13 +674,14 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(intent);
-                a.setupAddressViews(message, account, mToView, mCcView, true);
+                a.setupAddressViews(message, account, true);
                 String result = Address.parseAndPack(mToView.getText().toString());
-                String expected = Address.parseAndPack(FROM + ',' + TO1 + ',' + TO2 + ',' + TO3);
+                String expected = Address.parseAndPack(FROM);
                 assertEquals(expected, result);
                 result = Address.parseAndPack(mCcView.getText().toString());
-                expected = Address.parseAndPack(CC3);
+                expected = Address.parseAndPack(TO1 + ',' + TO2 + ',' + TO3+ ',' + CC3);
                 assertEquals(expected, result);
+                TestUtils.assertViewVisible(mCcView);
             }
         });
     }
@@ -605,7 +704,8 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(i2);
-                checkFields(RECIPIENT_TO + ", ", RECIPIENT_CC, RECIPIENT_BCC, SUBJECT, null, null);
+                checkFields(RECIPIENT_TO + ", ", RECIPIENT_CC + ", ", RECIPIENT_BCC + ", ", SUBJECT,
+                        null, mSignature);
                 checkFocused(mMessageView);
             }
         });
@@ -628,8 +728,8 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(i2);
-                checkFields(UTF16_RECIPIENT_TO + ", ",
-                        UTF16_RECIPIENT_CC, UTF16_RECIPIENT_BCC, UTF16_SUBJECT, null, null);
+                checkFields(UTF16_RECIPIENT_TO + ", ", UTF16_RECIPIENT_CC + ", ",
+                        UTF16_RECIPIENT_BCC + ", ", UTF16_SUBJECT, null, mSignature);
                 checkFocused(mMessageView);
             }
         });
@@ -652,8 +752,8 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(i2);
-                checkFields(UTF32_RECIPIENT_TO + ", ",
-                        UTF32_RECIPIENT_CC, UTF32_RECIPIENT_BCC, UTF32_SUBJECT, null, null);
+                checkFields(UTF32_RECIPIENT_TO + ", ", UTF32_RECIPIENT_CC + ", ",
+                        UTF32_RECIPIENT_BCC + ", ", UTF32_SUBJECT, null, mSignature);
                 checkFocused(mMessageView);
             }
         });
@@ -675,7 +775,7 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(i2);
-                checkFields(null, null, null, null, BODY, null);
+                checkFields(null, null, null, null, BODY, mSignature);
                 checkFocused(mToView);
             }
         });
@@ -699,7 +799,8 @@ public class MessageComposeTests
         runTestOnUiThread(new Runnable() {
             public void run() {
                 a.initFromIntent(i2);
-                checkFields(RECIPIENT_TO + ", ", null, null, "This is the subject", null, null);
+                checkFields(
+                        RECIPIENT_TO + ", ", null, null, "This is the subject", null, mSignature);
                 checkFocused(mMessageView);
             }
         });
@@ -729,6 +830,23 @@ public class MessageComposeTests
             assertEquals(0, toText.length());
         } else {
             assertEquals(to, toText);
+            TestUtils.assertViewVisible(mToView);
+        }
+
+        String ccText = mCcView.getText().toString();
+        if (cc == null) {
+            assertEquals(0, ccText.length());
+        } else {
+            assertEquals(cc, ccText);
+            TestUtils.assertViewVisible(mCcView);
+        }
+
+        String bccText = mBccView.getText().toString();
+        if (bcc == null) {
+            assertEquals(0, bccText.length());
+        } else {
+            assertEquals(bcc, bccText);
+            TestUtils.assertViewVisible(mBccView);
         }
 
         String subjectText = mSubjectView.getText().toString();
@@ -785,8 +903,7 @@ public class MessageComposeTests
      * @param content Content of the message
      * @return a complete Message object
      */
-    private Message buildTestMessage(String to, String sender, String subject, String content)
-            throws MessagingException {
+    private Message buildTestMessage(String to, String sender, String subject, String content) {
         Message message = new Message();
 
         if (to != null) {
@@ -820,25 +937,22 @@ public class MessageComposeTests
         mToView.performValidation();
 
         // address is validated as errorneous
-        assertNotNull(mToView.getError());
         assertFalse(messageCompose.isAddressAllValid());
 
         // the wrong address is preserved by validation
-        assertEquals("foo, ", mToView.getText().toString());
+        assertEquals("foo", mToView.getText().toString());
 
         mToView.setText("a@b.c");
         mToView.performValidation();
 
         // address is validated as correct
-        assertNull(mToView.getError());
         assertTrue(messageCompose.isAddressAllValid());
 
         mToView.setText("a@b.c, foo");
         mToView.performValidation();
 
-        assertNotNull(mToView.getError());
         assertFalse(messageCompose.isAddressAllValid());
-        assertEquals("a@b.c, foo, ", mToView.getText().toString());
+        assertEquals("a@b.c, foo", mToView.getText().toString());
     }
 
     /**
@@ -884,53 +998,37 @@ public class MessageComposeTests
 
     }
 
-    /**
-     * Tests for the comma-inserting logic.  The logic is applied equally to To: Cc: and Bcc:
-     * but we only run the full set on To:
-     */
-    public void testCommaInserting() throws Throwable {
-        // simple appending cases
-        checkCommaInsert("a", "", false);
-        checkCommaInsert("a@", "", false);
-        checkCommaInsert("a@b", "", false);
-        checkCommaInsert("a@b.", "", true); // non-optimal, but matches current implementation
-        checkCommaInsert("a@b.c", "", true);
-
-        // confirm works properly for internal editing
-        checkCommaInsert("me@foo.com, you", " they@bar.com", false);
-        checkCommaInsert("me@foo.com, you@", "they@bar.com", false);
-        checkCommaInsert("me@foo.com, you@bar", " they@bar.com", false);
-        checkCommaInsert("me@foo.com, you@bar.", " they@bar.com", true); // non-optimal
-        checkCommaInsert("me@foo.com, you@bar.com", " they@bar.com", true);
-
-        // check a couple of multi-period cases
-        checkCommaInsert("me.myself@foo", "", false);
-        checkCommaInsert("me.myself@foo.com", "", true);
-        checkCommaInsert("me@foo.co.uk", "", true);
-
-        // cases that should not append because there's already a comma
-        checkCommaInsert("a@b.c,", "", false);
-        checkCommaInsert("me@foo.com, you@bar.com,", " they@bar.com", false);
-        checkCommaInsert("me.myself@foo.com,", "", false);
-        checkCommaInsert("me@foo.co.uk,", "", false);
+    private static int sAttachmentId = 1;
+    private Attachment makeAttachment(String filename) {
+        Attachment a = new Attachment();
+        a.mId = sAttachmentId++;
+        a.mFileName = filename;
+        return a;
     }
 
-    /**
-     * Check comma insertion logic for a single try on the To: field
-     */
-    private void checkCommaInsert(final String before, final String after, boolean expectComma)
-            throws Throwable {
-        String expect = new String(before + (expectComma ? ", " : " ") + after);
+    @SmallTest
+    public void testSourceAttachmentsProcessing() {
+        // Attachments currently in the draft.
+        ArrayList<Attachment> currentAttachments = Lists.newArrayList(
+                makeAttachment("a.png"), makeAttachment("b.png"));
 
-        runTestOnUiThread(new Runnable() {
-            public void run() {
-                mToView.setText(before + after);
-                mToView.setSelection(before.length());
-            }
-        });
-        getInstrumentation().sendStringSync(" ");
-        String result = mToView.getText().toString();
-        assertEquals(expect, result);
+        // Attachments in the message being forwarded.
+        Attachment c = makeAttachment("c.png");
+        Attachment d = makeAttachment("d.png");
+        ArrayList<Attachment> sourceAttachments = Lists.newArrayList(c, d);
 
-     }
+        // Ensure the source attachments gets added.
+        final MessageCompose a = getActivity();
+        a.processSourceMessageAttachments(currentAttachments, sourceAttachments, true /*include*/);
+
+        assertEquals(4, currentAttachments.size());
+        assertTrue(currentAttachments.contains(c));
+        assertTrue(currentAttachments.contains(d));
+
+        // Now ensure they can be removed (e.g. in the case of switching from forward to reply).
+        a.processSourceMessageAttachments(currentAttachments, sourceAttachments, false /*include*/);
+        assertEquals(2, currentAttachments.size());
+        assertFalse(currentAttachments.contains(c));
+        assertFalse(currentAttachments.contains(d));
+    }
 }

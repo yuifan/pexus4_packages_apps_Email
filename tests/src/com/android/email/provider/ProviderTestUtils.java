@@ -16,15 +16,23 @@
 
 package com.android.email.provider;
 
-import com.android.email.Utility;
-import com.android.email.provider.EmailContent.Account;
-import com.android.email.provider.EmailContent.Attachment;
-import com.android.email.provider.EmailContent.HostAuth;
-import com.android.email.provider.EmailContent.Mailbox;
-import com.android.email.provider.EmailContent.Message;
+import com.android.emailcommon.internet.Rfc822Output;
+import com.android.emailcommon.provider.Account;
+import com.android.emailcommon.provider.EmailContent;
+import com.android.emailcommon.provider.EmailContent.Attachment;
+import com.android.emailcommon.provider.EmailContent.Body;
+import com.android.emailcommon.provider.EmailContent.Message;
+import com.android.emailcommon.provider.HostAuth;
+import com.android.emailcommon.provider.Mailbox;
+import com.android.emailcommon.utility.Utility;
 
+import android.content.ContentUris;
 import android.content.Context;
+import android.net.Uri;
 import android.test.MoreAsserts;
+
+import java.io.File;
+import java.io.FileOutputStream;
 
 import junit.framework.Assert;
 
@@ -46,7 +54,7 @@ public class ProviderTestUtils extends Assert {
         account.mEmailAddress = name + "@android.com";
         account.mSyncKey = "sync-key-" + name;
         account.mSyncLookback = 1;
-        account.mSyncInterval = EmailContent.Account.CHECK_INTERVAL_NEVER;
+        account.mSyncInterval = Account.CHECK_INTERVAL_NEVER;
         account.mHostAuthKeyRecv = 0;
         account.mHostAuthKeySend = 0;
         account.mFlags = 4;
@@ -56,7 +64,7 @@ public class ProviderTestUtils extends Assert {
         account.mRingtoneUri = "content://ringtone-" + name;
         account.mProtocolVersion = "2.5" + name;
         account.mNewMessageCount = 5 + name.length();
-        account.mSecurityFlags = 7;
+        account.mPolicyKey = 0;
         account.mSecuritySyncKey = "sec-sync-key-" + name;
         account.mSignature = "signature-" + name;
         if (saveIt) {
@@ -66,28 +74,35 @@ public class ProviderTestUtils extends Assert {
     }
 
     /**
-     * Create a hostauth record for test purposes
+     * Lightweight way of deleting an account for testing.
      */
-    public static HostAuth setupHostAuth(String name, long accountId, boolean saveIt,
-            Context context) {
-        return setupHostAuth("protocol", name, accountId, saveIt, context);
+    public static void deleteAccount(Context context, long accountId) {
+        context.getContentResolver().delete(ContentUris.withAppendedId(
+                Account.CONTENT_URI, accountId), null, null);
     }
 
     /**
      * Create a hostauth record for test purposes
      */
-    public static HostAuth setupHostAuth(String protocol, String name, long accountId,
-            boolean saveIt, Context context) {
+    public static HostAuth setupHostAuth(String name, long accountId, boolean saveIt,
+            Context context) {
+        return setupHostAuth("protocol", name, saveIt, context);
+    }
+
+    /**
+     * Create a hostauth record for test purposes
+     */
+    public static HostAuth setupHostAuth(String protocol, String name, boolean saveIt,
+            Context context) {
         HostAuth hostAuth = new HostAuth();
 
-        hostAuth.mProtocol = protocol + "-" + name;
+        hostAuth.mProtocol = protocol;
         hostAuth.mAddress = "address-" + name;
         hostAuth.mPort = 100;
         hostAuth.mFlags = 200;
         hostAuth.mLogin = "login-" + name;
         hostAuth.mPassword = "password-" + name;
         hostAuth.mDomain = "domain-" + name;
-        hostAuth.mAccountKey = accountId;
 
         if (saveIt) {
             hostAuth.save(context);
@@ -102,23 +117,30 @@ public class ProviderTestUtils extends Assert {
             Context context) {
         return setupMailbox(name, accountId, saveIt, context, Mailbox.TYPE_MAIL);
     }
-
     public static Mailbox setupMailbox(String name, long accountId, boolean saveIt,
             Context context, int type) {
+        return setupMailbox(name, accountId, saveIt, context, type, '/');
+    }
+    public static Mailbox setupMailbox(String name, long accountId, boolean saveIt,
+            Context context, int type, char delimiter) {
         Mailbox box = new Mailbox();
 
-        box.mDisplayName = name;
-        box.mServerId = "serverid-" + name;
+        int delimiterIndex = name.lastIndexOf(delimiter);
+        String displayName = name;
+        if (delimiterIndex > 0) {
+            displayName = name.substring(delimiterIndex + 1);
+        }
+        box.mDisplayName = displayName;
+        box.mServerId = name;
         box.mParentServerId = "parent-serverid-" + name;
+        box.mParentKey = 4;
         box.mAccountKey = accountId;
         box.mType = type;
-        box.mDelimiter = 1;
+        box.mDelimiter = delimiter;
         box.mSyncKey = "sync-key-" + name;
         box.mSyncLookback = 2;
-        box.mSyncInterval = EmailContent.Account.CHECK_INTERVAL_NEVER;
+        box.mSyncInterval = Account.CHECK_INTERVAL_NEVER;
         box.mSyncTime = 3;
-        // Should always be saved as zero
-        box.mUnreadCount = 0;
         box.mFlagVisible = true;
         box.mFlags = 5;
         box.mVisibleLimit = 6;
@@ -131,20 +153,26 @@ public class ProviderTestUtils extends Assert {
 
     /**
      * Create a message for test purposes
-     *
-     * TODO: body
-     * TODO: attachments
      */
     public static Message setupMessage(String name, long accountId, long mailboxId,
             boolean addBody, boolean saveIt, Context context) {
+        // Default starred, read,  (backword compatibility)
+        return setupMessage(name, accountId, mailboxId, addBody, saveIt, context, true, true);
+    }
+
+    /**
+     * Create a message for test purposes
+     */
+    public static Message setupMessage(String name, long accountId, long mailboxId,
+            boolean addBody, boolean saveIt, Context context, boolean starred, boolean read) {
         Message message = new Message();
 
         message.mDisplayName = name;
         message.mTimeStamp = 100 + name.length();
         message.mSubject = "subject " + name;
-        message.mFlagRead = true;
+        message.mFlagRead = read;
         message.mFlagLoaded = Message.FLAG_LOADED_UNLOADED;
-        message.mFlagFavorite = true;
+        message.mFlagFavorite = starred;
         message.mFlagAttachment = true;
         message.mFlags = 0;
 
@@ -180,17 +208,43 @@ public class ProviderTestUtils extends Assert {
     }
 
     /**
+     * Create a test body
+     *
+     * @param messageId the message this body belongs to
+     * @param textContent the plain text for the body
+     * @param htmlContent the html text for the body
+     * @param saveIt if true, write the new attachment directly to the DB
+     * @param context use this context
+     */
+    public static Body setupBody(long messageId, String textContent, String htmlContent,
+            boolean saveIt, Context context) {
+        Body body = new Body();
+        body.mMessageKey = messageId;
+        body.mTextContent = textContent;
+        body.mHtmlContent = htmlContent;
+        body.mTextReply = "text reply " + messageId;
+        body.mHtmlReply = "html reply " + messageId;
+        body.mSourceKey = messageId + 0x1000;
+        body.mIntroText = "intro text " + messageId;
+        if (saveIt) {
+            body.save(context);
+        }
+        return body;
+    }
+
+    /**
      * Create a test attachment.  A few fields are specified by params, and all other fields
      * are generated using pseudo-unique values.
      *
      * @param messageId the message to attach to
      * @param fileName the "file" to indicate in the attachment
      * @param length the "length" of the attachment
+     * @param flags the flags to set in the attachment
      * @param saveIt if true, write the new attachment directly to the DB
      * @param context use this context
      */
     public static Attachment setupAttachment(long messageId, String fileName, long length,
-            boolean saveIt, Context context) {
+            int flags, boolean saveIt, Context context) {
         Attachment att = new Attachment();
         att.mSize = length;
         att.mFileName = fileName;
@@ -201,12 +255,27 @@ public class ProviderTestUtils extends Assert {
         att.mLocation = "location " + fileName;
         att.mEncoding = "encoding " + fileName;
         att.mContent = "content " + fileName;
-        att.mFlags = 0;
+        att.mFlags = flags;
         att.mContentBytes = Utility.toUtf8("content " + fileName);
+        att.mAccountKey = messageId + 0x1000;
         if (saveIt) {
             att.save(context);
         }
         return att;
+    }
+
+    /**
+     * Create a test attachment with flags = 0 (see above)
+     *
+     * @param messageId the message to attach to
+     * @param fileName the "file" to indicate in the attachment
+     * @param length the "length" of the attachment
+     * @param saveIt if true, write the new attachment directly to the DB
+     * @param context use this context
+     */
+    public static Attachment setupAttachment(long messageId, String fileName, long length,
+            boolean saveIt, Context context) {
+        return setupAttachment(messageId, fileName, length, 0, saveIt, context);
     }
 
     private static void assertEmailContentEqual(String caller, EmailContent expect,
@@ -250,7 +319,7 @@ public class ProviderTestUtils extends Assert {
                 actual.mProtocolVersion);
         assertEquals(caller + " mNewMessageCount", expect.mNewMessageCount,
                 actual.mNewMessageCount);
-        assertEquals(caller + " mSecurityFlags", expect.mSecurityFlags, actual.mSecurityFlags);
+        assertEquals(caller + " mPolicyKey", expect.mPolicyKey, actual.mPolicyKey);
         assertEquals(caller + " mSecuritySyncKey", expect.mSecuritySyncKey,
                 actual.mSecuritySyncKey);
         assertEquals(caller + " mSignature", expect.mSignature, actual.mSignature);
@@ -260,11 +329,18 @@ public class ProviderTestUtils extends Assert {
      * Compare two hostauth records for equality
      */
     public static void assertHostAuthEqual(String caller, HostAuth expect, HostAuth actual) {
+        assertHostAuthEqual(caller, expect, actual, true);
+    }
+
+    public static void assertHostAuthEqual(String caller, HostAuth expect, HostAuth actual,
+            boolean testEmailContent) {
         if (expect == actual) {
             return;
         }
 
-        assertEmailContentEqual(caller, expect, actual);
+        if (testEmailContent) {
+            assertEmailContentEqual(caller, expect, actual);
+        }
         assertEquals(caller + " mProtocol", expect.mProtocol, actual.mProtocol);
         assertEquals(caller + " mAddress", expect.mAddress, actual.mAddress);
         assertEquals(caller + " mPort", expect.mPort, actual.mPort);
@@ -288,6 +364,7 @@ public class ProviderTestUtils extends Assert {
         assertEquals(caller + " mDisplayName", expect.mDisplayName, actual.mDisplayName);
         assertEquals(caller + " mServerId", expect.mServerId, actual.mServerId);
         assertEquals(caller + " mParentServerId", expect.mParentServerId, actual.mParentServerId);
+        assertEquals(caller + " mParentKey", expect.mParentKey, actual.mParentKey);
         assertEquals(caller + " mAccountKey", expect.mAccountKey, actual.mAccountKey);
         assertEquals(caller + " mType", expect.mType, actual.mType);
         assertEquals(caller + " mDelimiter", expect.mDelimiter, actual.mDelimiter);
@@ -295,7 +372,6 @@ public class ProviderTestUtils extends Assert {
         assertEquals(caller + " mSyncLookback", expect.mSyncLookback, actual.mSyncLookback);
         assertEquals(caller + " mSyncInterval", expect.mSyncInterval, actual.mSyncInterval);
         assertEquals(caller + " mSyncTime", expect.mSyncTime, actual.mSyncTime);
-        assertEquals(caller + " mUnreadCount", expect.mUnreadCount, actual.mUnreadCount);
         assertEquals(caller + " mFlagVisible", expect.mFlagVisible, actual.mFlagVisible);
         assertEquals(caller + " mFlags", expect.mFlags, actual.mFlags);
         assertEquals(caller + " mVisibleLimit", expect.mVisibleLimit, actual.mVisibleLimit);
@@ -338,6 +414,8 @@ public class ProviderTestUtils extends Assert {
 
         assertEquals(caller + " mMeetingInfo", expect.mMeetingInfo, actual.mMeetingInfo);
 
+        assertEquals(caller + " mSnippet", expect.mSnippet, actual.mSnippet);
+
         assertEquals(caller + " mText", expect.mText, actual.mText);
         assertEquals(caller + " mHtml", expect.mHtml, actual.mHtml);
         assertEquals(caller + " mTextReply", expect.mTextReply, actual.mTextReply);
@@ -369,5 +447,21 @@ public class ProviderTestUtils extends Assert {
         assertEquals(caller + " mFlags", expect.mFlags, actual.mFlags);
         MoreAsserts.assertEquals(caller + " mContentBytes",
                 expect.mContentBytes, actual.mContentBytes);
+        assertEquals(caller + " mAccountKey", expect.mAccountKey, actual.mAccountKey);
+    }
+
+    /**
+     * Create a temporary EML file based on {@code msg} in the directory {@code directory}.
+     */
+    public static Uri createTempEmlFile(Context context, Message msg, File directory)
+            throws Exception {
+        // Write out the message in rfc822 format
+        File outputFile = File.createTempFile("message", "tmp", directory);
+        assertNotNull(outputFile);
+        FileOutputStream outputStream = new FileOutputStream(outputFile);
+        Rfc822Output.writeTo(context, msg.mId, outputStream, true, false);
+        outputStream.close();
+
+        return Uri.fromFile(outputFile);
     }
 }
